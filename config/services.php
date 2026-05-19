@@ -44,6 +44,11 @@ return [
         'base_url' => env('STORE_CREATE_AI_BOT_URL', 'http://127.0.0.1:8091'),
         'timeout' => (int) env('STORE_CREATE_AI_BOT_TIMEOUT', 240),
     ],
+    'openai' => [
+        'api_key' => env('OPENAI_API_KEY'),
+        'model' => env('OPENAI_MODEL', 'gpt-4o-mini'),
+        'timeout' => (int) env('OPENAI_TIMEOUT', 45),
+    ],
     'domainnameapi' => [
         'environment' => env('DOMAINNAMEAPI_ENV', 'prod'),
         'reseller_id' => env('DOMAINNAMEAPI_RESELLER_ID'),

@@ -86,6 +86,67 @@ class AdminReactController extends Controller
     private const PASSWORD_RESET_SESSION_KEY = 'react_admin.pending_password_reset';
     private const ACCESS_MODES_SETTING_KEY = 'admin_access_modes_v1';
 
+    public function superadminAiFill(Request $request): JsonResponse
+    {
+        if (!$request->user()) {
+            return response()->json(['message' => 'Unauthenticated.'], 401);
+        }
+
+        $validated = $request->validate([
+            'mode' => 'nullable|string|in:field,page',
+            'route' => 'nullable|string|max:180',
+            'page_title' => 'nullable|string|max:180',
+            'field' => 'nullable|array',
+            'field.key' => 'nullable|string|max:80',
+            'field.label' => 'nullable|string|max:120',
+            'field.value' => 'nullable|string|max:2000',
+            'field.type' => 'nullable|string|max:40',
+            'fields' => 'nullable|array|max:30',
+            'fields.*.key' => 'nullable|string|max:80',
+            'fields.*.label' => 'nullable|string|max:120',
+            'fields.*.value' => 'nullable|string|max:2000',
+            'fields.*.type' => 'nullable|string|max:40',
+            'context' => 'nullable|array',
+        ]);
+
+        $mode = (string) ($validated['mode'] ?? 'field');
+        $fields = $mode === 'page'
+            ? array_values((array) ($validated['fields'] ?? []))
+            : [array_merge((array) ($validated['field'] ?? []), ['key' => (string) data_get($validated, 'field.key', 'field')])];
+
+        $fields = collect($fields)
+            ->map(function ($field, $index) {
+                return [
+                    'key' => (string) ($field['key'] ?? "field_{$index}"),
+                    'label' => (string) ($field['label'] ?? $field['key'] ?? "Field {$index}"),
+                    'value' => (string) ($field['value'] ?? ''),
+                    'type' => (string) ($field['type'] ?? 'text'),
+                ];
+            })
+            ->filter(fn ($field) => trim($field['label'] . $field['value']) !== '')
+            ->take(30)
+            ->values()
+            ->all();
+
+        if (empty($fields)) {
+            return response()->json(['message' => 'No AI-fillable field was found.'], 422);
+        }
+
+        $generated = app(AiStoreSeedService::class)->generateFieldCopy([
+            'mode' => $mode,
+            'route' => (string) ($validated['route'] ?? ''),
+            'page_title' => (string) ($validated['page_title'] ?? ''),
+            'context' => (array) ($validated['context'] ?? []),
+            'fields' => $fields,
+        ]);
+
+        if (empty($generated)) {
+            return response()->json(['message' => 'AI bot did not return any generated field value.'], 502);
+        }
+
+        return response()->json(['fields' => $generated]);
+    }
+
     public function merchantPaymentClients(Request $request): JsonResponse
     {
         if (!$request->user()) {

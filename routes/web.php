@@ -117,6 +117,7 @@ Route::prefix('react-admin-api')->group(function () {
         Route::post('/merchant-payment/clients/{id}/status', [AdminReactController::class, 'merchantPaymentClientStatus'])->whereNumber('id');
         Route::post('/merchant-payment/clients/{id}/withdraw', [AdminReactController::class, 'merchantPaymentClientWithdraw'])->whereNumber('id');
         Route::get('/superadmin/overview', [AdminReactController::class, 'superadminOverview']);
+        Route::post('/superadmin/ai-fill', [AdminReactController::class, 'superadminAiFill']);
         Route::get('/superadmin/clients', [AdminReactController::class, 'superadminClients']);
         Route::get('/superadmin/clients/paid', [AdminReactController::class, 'superadminPaidClients']);
         Route::get('/superadmin/clients/register', [AdminReactController::class, 'superadminRegisterClients']);

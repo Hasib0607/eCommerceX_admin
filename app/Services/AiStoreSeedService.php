@@ -77,6 +77,104 @@ class AiStoreSeedService
         return $this->blueprint($store, $businessCategory, $launchMode ?: 'ai', $aiPreferences);
     }
 
+    public function generateFieldCopy(array $payload): array
+    {
+        $fields = collect((array) ($payload['fields'] ?? []))
+            ->map(function ($field, $index) {
+                return [
+                    'key' => (string) ($field['key'] ?? "field_{$index}"),
+                    'label' => (string) ($field['label'] ?? $field['key'] ?? "Field {$index}"),
+                    'value' => (string) ($field['value'] ?? ''),
+                    'type' => (string) ($field['type'] ?? 'text'),
+                ];
+            })
+            ->filter(fn ($field) => trim($field['label'] . $field['value']) !== '')
+            ->take(30)
+            ->values()
+            ->all();
+
+        if (empty($fields)) {
+            return [];
+        }
+
+        $requestPayload = [
+            'mode' => (string) ($payload['mode'] ?? 'field'),
+            'route' => (string) ($payload['route'] ?? ''),
+            'page_title' => (string) ($payload['page_title'] ?? ''),
+            'context' => (array) ($payload['context'] ?? []),
+            'fields' => $fields,
+        ];
+
+        foreach ($this->botBaseUrls() as $baseUrl) {
+            try {
+                $response = Http::connectTimeout(15)
+                    ->timeout(min(120, max(30, (int) config('services.store_create_ai_bot.timeout', 240))))
+                    ->acceptJson()
+                    ->post($baseUrl . '/generate-field-copy', $requestPayload);
+
+                if ($response->successful()) {
+                    $generated = (array) $response->json('fields', []);
+                    $cleaned = collect($generated)
+                        ->map(fn ($value) => is_scalar($value) ? trim((string) $value) : '')
+                        ->filter(fn ($value) => $value !== '')
+                        ->all();
+                    if (!empty($cleaned)) {
+                        return $cleaned;
+                    }
+                }
+            } catch (Throwable $e) {
+                report($e);
+            }
+        }
+
+        return $this->generateFieldCopyWithOpenAi($requestPayload);
+    }
+
+    private function generateFieldCopyWithOpenAi(array $payload): array
+    {
+        $apiKey = (string) config('services.openai.api_key');
+        if ($apiKey === '') {
+            return [];
+        }
+
+        $systemPrompt = implode("\n", [
+            'You are the eCommerceX store creation and admin copy assistant.',
+            'Generate concise, production-ready ecommerce copy for admin form fields.',
+            'Respect the field label and current value. If a current value exists, improve it instead of ignoring it.',
+            'Keep button labels short. Keep titles clear. Keep descriptions/subtitles useful and natural.',
+            'Return only valid JSON with this exact shape: {"fields":{"field_key":"generated text"}}.',
+            'Do not include markdown, explanations, or extra keys.',
+        ]);
+
+        try {
+            $response = Http::withToken($apiKey)
+                ->acceptJson()
+                ->timeout((int) config('services.openai.timeout', 45))
+                ->post('https://api.openai.com/v1/chat/completions', [
+                    'model' => (string) config('services.openai.model', 'gpt-4o-mini'),
+                    'temperature' => 0.72,
+                    'response_format' => ['type' => 'json_object'],
+                    'messages' => [
+                        ['role' => 'system', 'content' => $systemPrompt],
+                        ['role' => 'user', 'content' => json_encode($payload, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES)],
+                    ],
+                ]);
+        } catch (Throwable $e) {
+            report($e);
+            return [];
+        }
+
+        if (!$response->successful()) {
+            return [];
+        }
+
+        $decoded = json_decode((string) data_get($response->json(), 'choices.0.message.content', ''), true);
+        return collect((array) ($decoded['fields'] ?? []))
+            ->map(fn ($value) => is_scalar($value) ? trim((string) $value) : '')
+            ->filter(fn ($value) => $value !== '')
+            ->all();
+    }
+
     private function blueprint(Store $store, ?BusinessCategory $businessCategory, string $launchMode, ?array $aiPreferences): array
     {
         $previewBlueprint = $aiPreferences['preview_blueprint'] ?? null;
