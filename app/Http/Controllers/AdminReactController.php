@@ -101,11 +101,19 @@ class AdminReactController extends Controller
             'field.label' => 'nullable|string|max:120',
             'field.value' => 'nullable|string|max:2000',
             'field.type' => 'nullable|string|max:40',
+            'field.placeholder' => 'nullable|string|max:180',
+            'field.name' => 'nullable|string|max:120',
+            'field.section' => 'nullable|string|max:240',
+            'field.nearby_text' => 'nullable|string|max:800',
             'fields' => 'nullable|array|max:30',
             'fields.*.key' => 'nullable|string|max:80',
             'fields.*.label' => 'nullable|string|max:120',
             'fields.*.value' => 'nullable|string|max:2000',
             'fields.*.type' => 'nullable|string|max:40',
+            'fields.*.placeholder' => 'nullable|string|max:180',
+            'fields.*.name' => 'nullable|string|max:120',
+            'fields.*.section' => 'nullable|string|max:240',
+            'fields.*.nearby_text' => 'nullable|string|max:800',
             'context' => 'nullable|array',
         ]);
 
@@ -121,6 +129,10 @@ class AdminReactController extends Controller
                     'label' => (string) ($field['label'] ?? $field['key'] ?? "Field {$index}"),
                     'value' => (string) ($field['value'] ?? ''),
                     'type' => (string) ($field['type'] ?? 'text'),
+                    'placeholder' => (string) ($field['placeholder'] ?? ''),
+                    'name' => (string) ($field['name'] ?? ''),
+                    'section' => (string) ($field['section'] ?? ''),
+                    'nearby_text' => (string) ($field['nearby_text'] ?? ''),
                 ];
             })
             ->filter(fn ($field) => trim($field['label'] . $field['value']) !== '')

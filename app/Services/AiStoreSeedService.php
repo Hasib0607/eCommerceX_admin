@@ -86,6 +86,10 @@ class AiStoreSeedService
                     'label' => (string) ($field['label'] ?? $field['key'] ?? "Field {$index}"),
                     'value' => (string) ($field['value'] ?? ''),
                     'type' => (string) ($field['type'] ?? 'text'),
+                    'placeholder' => (string) ($field['placeholder'] ?? ''),
+                    'name' => (string) ($field['name'] ?? ''),
+                    'section' => (string) ($field['section'] ?? ''),
+                    'nearby_text' => (string) ($field['nearby_text'] ?? ''),
                 ];
             })
             ->filter(fn ($field) => trim($field['label'] . $field['value']) !== '')
@@ -115,7 +119,10 @@ class AiStoreSeedService
                 if ($response->successful()) {
                     $generated = (array) $response->json('fields', []);
                     $cleaned = collect($generated)
-                        ->map(fn ($value) => is_scalar($value) ? trim((string) $value) : '')
+                        ->map(function ($value, $key) use ($fields) {
+                            $field = collect($fields)->firstWhere('key', (string) $key) ?: [];
+                            return is_scalar($value) ? $this->normalizeGeneratedFieldCopy((string) $value, $field) : '';
+                        })
                         ->filter(fn ($value) => $value !== '')
                         ->all();
                     if (!empty($cleaned)) {
@@ -140,8 +147,12 @@ class AiStoreSeedService
         $systemPrompt = implode("\n", [
             'You are the eCommerceX store creation and admin copy assistant.',
             'Generate concise, production-ready ecommerce copy for admin form fields.',
-            'Respect the field label and current value. If a current value exists, improve it instead of ignoring it.',
+            'Understand the current page/route, page headings, section tabs, active section, nearby field text, and visible form values before writing.',
+            'If a current value exists, treat it as the user hint and generate only the improved final field value.',
             'Keep button labels short. Keep titles clear. Keep descriptions/subtitles useful and natural.',
+            'Do not generate unrelated generic text; match the page purpose and the field section.',
+            'Never include field labels, instruction text, examples like e.g., explanations, prefixes, or quotation marks in generated values.',
+            'For a label such as "Brief description of the plan (e.g., \'Ideal starter package for beginners\')", return only "Ideal starter package for beginners".',
             'Return only valid JSON with this exact shape: {"fields":{"field_key":"generated text"}}.',
             'Do not include markdown, explanations, or extra keys.',
         ]);
@@ -170,9 +181,55 @@ class AiStoreSeedService
 
         $decoded = json_decode((string) data_get($response->json(), 'choices.0.message.content', ''), true);
         return collect((array) ($decoded['fields'] ?? []))
-            ->map(fn ($value) => is_scalar($value) ? trim((string) $value) : '')
+            ->map(function ($value, $key) use ($payload) {
+                $field = collect((array) ($payload['fields'] ?? []))->firstWhere('key', (string) $key) ?: [];
+                return is_scalar($value) ? $this->normalizeGeneratedFieldCopy((string) $value, (array) $field) : '';
+            })
             ->filter(fn ($value) => $value !== '')
             ->all();
+    }
+
+    private function normalizeGeneratedFieldCopy(string $value, array $field): string
+    {
+        $text = trim($value);
+        $label = trim((string) ($field['label'] ?? ''));
+        $instruction = trim(implode(' ', array_filter([
+            $label,
+            (string) ($field['placeholder'] ?? ''),
+            (string) ($field['nearby_text'] ?? ''),
+        ])));
+        $example = $this->extractFieldInstructionExample($instruction);
+        $lowerText = strtolower($text);
+
+        if ($example !== '' && (
+            $lowerText === strtolower($instruction)
+            || str_contains($lowerText, 'e.g.')
+            || str_contains($lowerText, 'example')
+            || ($label !== '' && str_starts_with($lowerText, strtolower($label)))
+        )) {
+            return $example;
+        }
+
+        if ($label !== '' && str_starts_with($lowerText, strtolower($label))) {
+            $text = ltrim(substr($text, strlen($label)), " :-—–\t\n\r\0\x0B");
+        }
+
+        return trim($text, " \t\n\r\0\x0B\"'");
+    }
+
+    private function extractFieldInstructionExample(string $instruction): string
+    {
+        foreach ([
+            "/e\\.g\\.,?\\s*['\"]([^'\"]+)['\"]/i",
+            "/example[:\\s]+['\"]([^'\"]+)['\"]/i",
+            "/for example[:\\s]+['\"]([^'\"]+)['\"]/i",
+        ] as $pattern) {
+            if (preg_match($pattern, $instruction, $matches)) {
+                return trim((string) ($matches[1] ?? ''));
+            }
+        }
+
+        return '';
     }
 
     private function blueprint(Store $store, ?BusinessCategory $businessCategory, string $launchMode, ?array $aiPreferences): array
