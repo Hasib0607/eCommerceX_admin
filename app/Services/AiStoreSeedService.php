@@ -152,10 +152,21 @@ class AiStoreSeedService
             'Keep button labels short. Keep titles clear. Keep descriptions/subtitles useful and natural.',
             'Do not generate unrelated generic text; match the page purpose and the field section.',
             'Never include field labels, instruction text, examples like e.g., explanations, prefixes, or quotation marks in generated values.',
-            'For a label such as "Brief description of the plan (e.g., \'Ideal starter package for beginners\')", return only "Ideal starter package for beginners".',
+            'For a label such as "Briefly describe the plan (e.g., Ideal for beginners)", return only a final value like "Ideal for beginners".',
+            'If a field payload includes word_limit, stay at or below that many words.',
             'Return only valid JSON with this exact shape: {"fields":{"field_key":"generated text"}}.',
             'Do not include markdown, explanations, or extra keys.',
         ]);
+
+        $payload['fields'] = collect((array) ($payload['fields'] ?? []))
+            ->map(function ($field) {
+                $limit = $this->extractFieldWordLimit((array) $field);
+                if ($limit) {
+                    $field['word_limit'] = $limit;
+                }
+                return $field;
+            })
+            ->all();
 
         try {
             $response = Http::withToken($apiKey)
@@ -199,6 +210,7 @@ class AiStoreSeedService
             (string) ($field['nearby_text'] ?? ''),
         ])));
         $example = $this->extractFieldInstructionExample($instruction);
+        $wordLimit = $this->extractFieldWordLimit($field);
         $lowerText = strtolower($text);
 
         if ($example !== '' && (
@@ -207,20 +219,21 @@ class AiStoreSeedService
             || str_contains($lowerText, 'example')
             || ($label !== '' && str_starts_with($lowerText, strtolower($label)))
         )) {
-            return $example;
+            return $this->limitGeneratedFieldWords($example, $wordLimit);
         }
 
         if ($label !== '' && str_starts_with($lowerText, strtolower($label))) {
             $text = ltrim(substr($text, strlen($label)), " :-—–\t\n\r\0\x0B");
         }
 
-        return trim($text, " \t\n\r\0\x0B\"'");
+        return $this->limitGeneratedFieldWords(trim($text, " \t\n\r\0\x0B\"'"), $wordLimit);
     }
 
     private function extractFieldInstructionExample(string $instruction): string
     {
         foreach ([
             "/e\\.g\\.,?\\s*['\"]([^'\"]+)['\"]/i",
+            "/e\\.g\\.,?\\s*([^\\)；;\\.\\n\\r]+)/i",
             "/example[:\\s]+['\"]([^'\"]+)['\"]/i",
             "/for example[:\\s]+['\"]([^'\"]+)['\"]/i",
         ] as $pattern) {
@@ -230,6 +243,42 @@ class AiStoreSeedService
         }
 
         return '';
+    }
+
+    private function extractFieldWordLimit(array $field): ?int
+    {
+        $text = strtolower(implode(' ', array_filter([
+            (string) ($field['value'] ?? ''),
+            (string) ($field['label'] ?? ''),
+            (string) ($field['placeholder'] ?? ''),
+            (string) ($field['nearby_text'] ?? ''),
+        ])));
+
+        foreach ([
+            '/(?:within|under|max(?:imum)?|limit|up to)\s+(\d{1,3})\s+words?/i',
+            '/(\d{1,3})\s+words?\s*(?:max|maximum|limit|within|under|er moddhe|er majhe|er vitore|moddhe|majhe|vitore)?/i',
+            '/(\d{1,3})\s*(?:টি|ta)?\s*(?:শব্দ|word)\s*(?:এর মধ্যে|এর মাঝে|er moddhe|er majhe|moddhe|majhe)?/iu',
+        ] as $pattern) {
+            if (preg_match($pattern, $text, $matches)) {
+                return max(1, min(80, (int) ($matches[1] ?? 0)));
+            }
+        }
+
+        return null;
+    }
+
+    private function limitGeneratedFieldWords(string $value, ?int $limit): string
+    {
+        if (!$limit) {
+            return $value;
+        }
+
+        $words = preg_split('/\s+/u', trim($value), -1, PREG_SPLIT_NO_EMPTY) ?: [];
+        if (count($words) <= $limit) {
+            return $value;
+        }
+
+        return rtrim(implode(' ', array_slice($words, 0, $limit)), " ,.;:-");
     }
 
     private function blueprint(Store $store, ?BusinessCategory $businessCategory, string $launchMode, ?array $aiPreferences): array
