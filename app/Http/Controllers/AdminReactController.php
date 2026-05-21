@@ -61,23 +61,29 @@ use App\Models\User;
 use App\Models\Transaction;
 use App\Models\Veriant;
 use App\Models\WebsiteSetupDetails;
+use App\Models\Websitesetup;
+use App\Models\SuperstaffSalesCommissionBalance;
 use App\Models\Staff;
 use App\Models\SupportQueue;
 use App\Models\MarchantPaymentGetway;
 use App\Models\Digitalplan;
+use App\Support\AdminContactValidation;
 use App\Services\EntitlementService;
 use App\Services\AiStoreSeedService;
 use App\Services\DomainNameApiService;
+use App\Services\WhatsAppAutomation\BotApiService;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Auth;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Hash;
+use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Facades\Mail;
 use Illuminate\Support\Facades\Storage;
 use Illuminate\Support\Facades\Schema;
 use Illuminate\Support\Str;
 use Illuminate\Support\Facades\Response;
+use Illuminate\Validation\ValidationException;
 use Carbon\Carbon;
 
 class AdminReactController extends Controller
@@ -85,6 +91,8 @@ class AdminReactController extends Controller
     private const REGISTRATION_SESSION_KEY = 'react_admin.pending_registration';
     private const PASSWORD_RESET_SESSION_KEY = 'react_admin.pending_password_reset';
     private const ACCESS_MODES_SETTING_KEY = 'admin_access_modes_v1';
+    private const TRIAL_PERIOD_DAYS_SETTING_KEY = 'trial_period_days';
+    private const DEFAULT_TRIAL_PERIOD_DAYS = 14;
 
     public function superadminAiFill(Request $request): JsonResponse
     {
@@ -615,7 +623,8 @@ class AdminReactController extends Controller
                     'id' => (int) $row->id,
                     'name' => (string) ($row->name ?? ''),
                     'price' => (float) ($row->price ?? 0),
-                    'price_usd' => null,
+                    'usd_price' => $row->usd_price !== null ? (float) $row->usd_price : null,
+                    'price_usd' => $row->usd_price !== null ? (float) $row->usd_price : null,
                     'staff' => (string) ($row->staff ?? ''),
                     'product' => (string) ($row->product ?? ''),
                     'google_ad' => (string) ($row->google_ad ?? ''),
@@ -623,6 +632,7 @@ class AdminReactController extends Controller
                     'monthly_chat_support' => (string) ($row->monthly_chat_support ?? ''),
                     'position' => (int) ($row->position ?? 0),
                     'status' => (string) ($row->status ?? ''),
+                    'is_trial' => $this->tableHasColumn('plans', 'is_trial') ? (bool) ($row->is_trial ?? false) : in_array((int) $row->id, [6, 9], true),
                     'plan_type' => 'website',
                 ];
             })->values();
@@ -702,7 +712,8 @@ class AdminReactController extends Controller
             'sixdis' => $row->sixdis,
             'twelvedis' => $row->twelvedis,
             'twentyfourdis' => $row->twentyfourdis,
-            'price_usd' => $type === 'pos' ? (float) ($row->usd_price ?? 0) : $row->usd_price,
+            'usd_price' => $row->usd_price !== null ? (float) $row->usd_price : null,
+            'price_usd' => $row->usd_price !== null ? (float) $row->usd_price : null,
             'usd_discount_type' => (string) ($row->usd_discount_type ?? 'no_discount'),
             'usd_1_dis' => $row->usd_1_dis,
             'usd_6_dis' => $row->usd_6_dis,
@@ -722,6 +733,9 @@ class AdminReactController extends Controller
             'upload_file_limit' => $row->upload_file_limit,
             'position' => (int) ($row->position ?? 0),
             'status' => $row->status,
+            'is_trial' => $type === 'website'
+                ? ($this->tableHasColumn('plans', 'is_trial') ? (bool) ($row->is_trial ?? false) : in_array((int) $row->id, [6, 9], true))
+                : false,
             'plan_type' => $type,
             'details' => $type === 'website'
                 ? collect($row->details ?? [])->map(function ($detail) {
@@ -751,6 +765,12 @@ class AdminReactController extends Controller
 
         $this->syncDiscoveredFeatureCatalog();
         $features = SaasFeature::query()
+            ->where(function ($query) {
+                $query
+                    ->where('key', 'like', 'pages.%')
+                    ->orWhere('key', 'like', 'quota.%')
+                    ->orWhere('key', 'like', 'admin.%');
+            })
             ->orderBy('type', 'asc')
             ->orderBy('key', 'asc')
             ->get(['key', 'name', 'type', 'enabled_by_default', 'default_limit']);
@@ -796,6 +816,7 @@ class AdminReactController extends Controller
             'sixdis' => ['nullable', 'numeric', 'min:0'],
             'twelvedis' => ['nullable', 'numeric', 'min:0'],
             'twentyfourdis' => ['nullable', 'numeric', 'min:0'],
+            'usd_price' => ['nullable', 'numeric', 'min:0'],
             'price_usd' => ['nullable', 'numeric', 'min:0'],
             'usd_discount_type' => ['nullable', 'string', 'max:255'],
             'usd_1_dis' => ['nullable', 'numeric', 'min:0'],
@@ -816,6 +837,7 @@ class AdminReactController extends Controller
             'upload_file_limit' => ['nullable', 'integer', 'min:0'],
             'position' => ['nullable', 'integer', 'min:1'],
             'status' => ['nullable'],
+            'is_trial' => ['nullable', 'boolean'],
             'details' => ['nullable', 'array'],
             'details.*.id' => ['nullable', 'integer'],
             'details.*.title' => ['nullable', 'string', 'max:255'],
@@ -840,7 +862,7 @@ class AdminReactController extends Controller
             $row->sixdis = $payload['sixdis'] ?? null;
             $row->twelvedis = $payload['twelvedis'] ?? null;
             $row->twentyfourdis = $payload['twentyfourdis'] ?? null;
-            $row->usd_price = $payload['price_usd'] ?? null;
+            $row->usd_price = $payload['usd_price'] ?? $payload['price_usd'] ?? null;
             $row->usd_discount_type = (string) ($payload['usd_discount_type'] ?? 'no_discount');
             $row->usd_1_dis = $payload['usd_1_dis'] ?? null;
             $row->usd_6_dis = $payload['usd_6_dis'] ?? null;
@@ -858,8 +880,9 @@ class AdminReactController extends Controller
             $row->payment_processing_charge = $payload['payment_processing_charge'] ?? 0;
             $row->monthly_chat_support = (string) ($payload['monthly_chat_support'] ?? '');
             $row->upload_file_limit = $payload['upload_file_limit'] ?? 0;
+            $this->applyWebsiteTrialPlanFlag($row, (bool) ($payload['is_trial'] ?? false));
         } elseif ($type === 'pos') {
-            $row->usd_price = $payload['price_usd'] ?? 0;
+            $row->usd_price = $payload['usd_price'] ?? $payload['price_usd'] ?? 0;
             $row->staff = (string) ($payload['staff'] ?? '');
             $row->product = (string) ($payload['product'] ?? '');
             $row->order = (string) ($payload['order'] ?? '');
@@ -876,6 +899,9 @@ class AdminReactController extends Controller
             ? $this->normalizePlanStatusValue($payload['status'], $row->status ?? null)
             : 'active';
         $row->save();
+        if ($type === 'website') {
+            $this->syncExclusiveWebsiteTrialPlan($row);
+        }
 
         if ($type === 'website') {
             foreach (($payload['details'] ?? []) as $index => $detailPayload) {
@@ -914,6 +940,7 @@ class AdminReactController extends Controller
             'sixdis' => ['nullable', 'numeric', 'min:0'],
             'twelvedis' => ['nullable', 'numeric', 'min:0'],
             'twentyfourdis' => ['nullable', 'numeric', 'min:0'],
+            'usd_price' => ['nullable', 'numeric', 'min:0'],
             'price_usd' => ['nullable', 'numeric', 'min:0'],
             'usd_discount_type' => ['nullable', 'string', 'max:255'],
             'usd_1_dis' => ['nullable', 'numeric', 'min:0'],
@@ -934,6 +961,7 @@ class AdminReactController extends Controller
             'upload_file_limit' => ['nullable', 'integer', 'min:0'],
             'position' => ['nullable', 'integer', 'min:1'],
             'status' => ['nullable'],
+            'is_trial' => ['nullable', 'boolean'],
             'details' => ['nullable', 'array'],
             'details.*.id' => ['nullable', 'integer'],
             'details.*.title' => ['nullable', 'string', 'max:255'],
@@ -957,7 +985,7 @@ class AdminReactController extends Controller
             $row->sixdis = $payload['sixdis'] ?? null;
             $row->twelvedis = $payload['twelvedis'] ?? null;
             $row->twentyfourdis = $payload['twentyfourdis'] ?? null;
-            $row->usd_price = $payload['price_usd'] ?? null;
+            $row->usd_price = $payload['usd_price'] ?? $payload['price_usd'] ?? null;
             $row->usd_discount_type = (string) ($payload['usd_discount_type'] ?? 'no_discount');
             $row->usd_1_dis = $payload['usd_1_dis'] ?? null;
             $row->usd_6_dis = $payload['usd_6_dis'] ?? null;
@@ -975,8 +1003,13 @@ class AdminReactController extends Controller
             $row->payment_processing_charge = $payload['payment_processing_charge'] ?? 0;
             $row->monthly_chat_support = (string) ($payload['monthly_chat_support'] ?? '');
             $row->upload_file_limit = $payload['upload_file_limit'] ?? 0;
+            if (array_key_exists('is_trial', $payload)) {
+                $this->applyWebsiteTrialPlanFlag($row, (bool) $payload['is_trial']);
+            }
         } elseif ($type === 'pos') {
-            if (array_key_exists('price_usd', $payload)) $row->usd_price = (float) ($payload['price_usd'] ?? 0);
+            if (array_key_exists('usd_price', $payload) || array_key_exists('price_usd', $payload)) {
+                $row->usd_price = (float) ($payload['usd_price'] ?? $payload['price_usd'] ?? 0);
+            }
             $row->staff = (string) ($payload['staff'] ?? '');
             $row->product = (string) ($payload['product'] ?? '');
             $row->order = (string) ($payload['order'] ?? '');
@@ -993,6 +1026,9 @@ class AdminReactController extends Controller
             $row->status = $this->normalizePlanStatusValue($payload['status'], $row->status ?? null);
         }
         $row->save();
+        if ($type === 'website') {
+            $this->syncExclusiveWebsiteTrialPlan($row);
+        }
 
         if ($type === 'website') {
             $submittedIds = [];
@@ -1066,6 +1102,88 @@ class AdminReactController extends Controller
             'message' => 'Plan status updated.',
             'value' => $row->status,
         ]);
+    }
+
+    public function superadminPlanToggleTrial(Request $request, string $planType, int $id): JsonResponse
+    {
+        if ($error = $this->ensureSuperadminClientAccess($request)) return $error;
+        [$type, $modelClass] = $this->resolvePlanTypeAndModel($planType);
+        if ($type !== 'website' || !$modelClass) {
+            return response()->json(['message' => 'Trial package can be selected only for website plans.'], 422);
+        }
+        if (!$this->tableHasColumn('plans', 'is_trial')) {
+            return response()->json(['message' => 'Trial package column is missing. Please run the latest migration.'], 422);
+        }
+
+        $row = $modelClass::query()->find($id);
+        if (!$row) return response()->json(['message' => 'Plan not found.'], 404);
+
+        $row->is_trial = !((bool) ($row->is_trial ?? false));
+        $row->save();
+        $this->syncExclusiveWebsiteTrialPlan($row);
+
+        return response()->json([
+            'status' => true,
+            'message' => (bool) $row->is_trial ? 'Trial package selected.' : 'Trial package removed.',
+            'value' => (bool) $row->is_trial,
+        ]);
+    }
+
+    private function applyWebsiteTrialPlanFlag($row, bool $isTrial): void
+    {
+        if ($this->tableHasColumn('plans', 'is_trial')) {
+            $row->is_trial = $isTrial;
+        }
+    }
+
+    private function syncExclusiveWebsiteTrialPlan($row): void
+    {
+        if (!$this->tableHasColumn('plans', 'is_trial') || !((bool) ($row->is_trial ?? false))) {
+            return;
+        }
+
+        Plan::query()
+            ->where('id', '!=', (int) $row->id)
+            ->where('is_trial', true)
+            ->update(['is_trial' => false]);
+    }
+
+    private function currentWebsiteTrialPlanId(): ?int
+    {
+        if ($this->tableHasColumn('plans', 'is_trial')) {
+            $id = Plan::query()
+                ->where('is_trial', true)
+                ->where(function ($query) {
+                    $query->whereNull('status')
+                        ->orWhereIn('status', ['1', 1, 'true', true, 'active', 'enabled', 'on']);
+                })
+                ->orderBy('position', 'asc')
+                ->orderBy('id', 'asc')
+                ->value('id');
+
+            return $id ? (int) $id : null;
+        }
+
+        $legacyId = Plan::query()
+            ->whereIn('id', [6, 9])
+            ->orderByRaw('FIELD(id, 6, 9)')
+            ->value('id');
+
+        return $legacyId ? (int) $legacyId : null;
+    }
+
+    private function isWebsiteTrialPlanId($planId): bool
+    {
+        $planId = (int) $planId;
+        if ($planId <= 0) {
+            return false;
+        }
+
+        if ($this->tableHasColumn('plans', 'is_trial')) {
+            return Plan::query()->where('id', $planId)->where('is_trial', true)->exists();
+        }
+
+        return in_array($planId, [6, 9], true);
     }
 
     public function superadminPlanReorder(Request $request, string $planType): JsonResponse
@@ -1177,35 +1295,22 @@ class AdminReactController extends Controller
             }
         }
 
-        // Keep legacy permission tokens manageable from same matrix.
-        foreach ($this->superadminRolePermissionKeys() as $token) {
-            $token = trim((string) $token);
-            if ($token === '') continue;
-            $legacyKey = 'legacy.' . $token;
-            $features[$legacyKey] = [
-                'key' => $legacyKey,
-                'name' => 'Legacy: ' . $this->humanizeFeatureKey($token),
-                'type' => 'action',
-                'enabled_by_default' => true,
-                'default_limit' => null,
-            ];
-        }
-
-        // Auto-discover superadmin API routes (create/edit/delete/update etc.) for dynamic access matrix.
+        // Auto-discover admin API routes (create/edit/delete/update etc.) for dynamic access matrix.
         $webRoutesFile = base_path('routes/web.php');
         if (is_file($webRoutesFile)) {
             $content = @file_get_contents($webRoutesFile) ?: '';
             if ($content !== '') {
-                preg_match_all('/Route::(get|post|put|patch|delete)\(\s*[\'"]\/superadmin\/([^\'"]+)[\'"]\s*,/i', $content, $matches, PREG_SET_ORDER);
+                preg_match_all('/Route::(get|post|put|patch|delete)\(\s*[\'"]\/([^\'"]+)[\'"]\s*,/i', $content, $matches, PREG_SET_ORDER);
                 foreach ($matches as $match) {
                     $method = strtolower(trim((string) ($match[1] ?? 'get')));
                     $path = trim((string) ($match[2] ?? ''));
                     if ($path === '') continue;
+                    if ($this->shouldSkipAdminEntitlementRoute($path)) continue;
 
                     $normalizedPath = preg_replace('/\{[^}]+\}/', '*', $path);
                     $normalizedPath = str_replace('/', '.', (string) $normalizedPath);
                     $normalizedPath = preg_replace('/[^a-zA-Z0-9._*-]/', '', (string) $normalizedPath) ?: 'unknown';
-                    $key = 'superadmin.' . $method . '.' . strtolower($normalizedPath);
+                    $key = 'admin.' . $method . '.' . strtolower($normalizedPath);
 
                     $type = $method === 'get' ? 'page' : 'action';
                     $name = strtoupper($method) . ': ' . $this->humanizeFeatureKey($path);
@@ -1232,6 +1337,28 @@ class AdminReactController extends Controller
                 ]
             );
         }
+    }
+
+    private function shouldSkipAdminEntitlementRoute(string $path): bool
+    {
+        $path = trim($path, '/');
+        if ($path === '') return true;
+
+        foreach ([
+            'csrf-token',
+            'login',
+            'logout',
+            'register',
+            'password',
+            'public',
+            'superadmin',
+        ] as $prefix) {
+            if ($path === $prefix || str_starts_with($path, $prefix . '/')) {
+                return true;
+            }
+        }
+
+        return false;
     }
 
     private function humanizeFeatureKey(string $value): string
@@ -1449,6 +1576,7 @@ class AdminReactController extends Controller
         return response()->json([
             'items' => $settings,
             'domain_connect_status' => (string) ($settings['domain_connect_status'] ?? '0'),
+            'trial_period_days' => $this->superadminTrialPeriodDays($settings),
             'base_color' => (string) ($settings['base_color'] ?? ''),
             'theme_color' => (string) ($settings['theme_color'] ?? ''),
             'panel_logo' => (string) ($settings['panel_logo'] ?? ''),
@@ -1529,6 +1657,10 @@ class AdminReactController extends Controller
         foreach (($payload['settings'] ?? []) as $key => $value) {
             $name = trim((string) $key);
             if ($name === '' || !preg_match('/^[a-zA-Z0-9._-]+$/', $name)) continue;
+            if ($name === self::TRIAL_PERIOD_DAYS_SETTING_KEY) {
+                $pairs[$name] = (string) $this->normalizeTrialPeriodDays($value);
+                continue;
+            }
             $pairs[$name] = is_scalar($value) || $value === null ? (string) ($value ?? '') : json_encode($value);
         }
 
@@ -1539,6 +1671,7 @@ class AdminReactController extends Controller
         return response()->json([
             'status' => true,
             'message' => 'Settings saved successfully.',
+            'trial_period_days' => $this->superadminTrialPeriodDays($settings),
             'panel_logo' => (string) ($settings['panel_logo'] ?? ''),
             'panel_logo_url' => $this->resolveSettingAssetPublicUrl(
                 (string) ($settings['panel_logo'] ?? $settings['panel_logo_dark'] ?? ''),
@@ -1560,6 +1693,30 @@ class AdminReactController extends Controller
                 'assets/images/setting/favicon'
             ),
         ]);
+    }
+
+    private function superadminTrialPeriodDays($settings = null): int
+    {
+        if ($settings instanceof \Illuminate\Support\Collection || is_array($settings)) {
+            $raw = $settings[self::TRIAL_PERIOD_DAYS_SETTING_KEY] ?? null;
+        } else {
+            $raw = SuperAdminSetting::getValue(
+                self::TRIAL_PERIOD_DAYS_SETTING_KEY,
+                self::DEFAULT_TRIAL_PERIOD_DAYS
+            );
+        }
+
+        return $this->normalizeTrialPeriodDays($raw);
+    }
+
+    private function normalizeTrialPeriodDays($value): int
+    {
+        $days = (int) $value;
+        if ($days < 1) {
+            return self::DEFAULT_TRIAL_PERIOD_DAYS;
+        }
+
+        return min($days, 365);
     }
 
     public function superadminSettingsCurrencyList(Request $request): JsonResponse
@@ -2934,7 +3091,7 @@ class AdminReactController extends Controller
             'custom_domain' => ['nullable', 'string', 'max:255'],
             'currency' => ['required', 'integer', 'exists:currencies,id'],
             'package_type' => ['nullable', 'string', 'max:20'],
-            'phone' => ['nullable', 'string', 'max:30'],
+            'phone' => AdminContactValidation::phoneRules(false, 30),
         ]);
 
         $client = User::query()
@@ -3721,8 +3878,8 @@ class AdminReactController extends Controller
         $rules = [
             'name' => ['required', 'string', 'max:255'],
             'username' => ['required', 'string', 'max:255'],
-            'phone' => ['required', 'string', 'max:50'],
-            'email' => ['nullable', 'email', 'max:255'],
+            'phone' => AdminContactValidation::phoneRules(true, 50),
+            'email' => AdminContactValidation::emailRules(false, 255),
             'address' => ['nullable', 'string', 'max:500'],
             'new_commission' => ['nullable', 'numeric'],
             'renew_commission' => ['nullable', 'numeric'],
@@ -3915,6 +4072,95 @@ class AdminReactController extends Controller
         return response()->json([
             'user' => $this->formatUser($user),
             'active_store' => $this->activeStoreSummary($user),
+        ]);
+    }
+
+    public function adminStaffDashboard(Request $request): JsonResponse
+    {
+        $user = $request->user();
+        if (!$user) {
+            return response()->json(['message' => 'Unauthenticated.'], 401);
+        }
+
+        $staff = Staff::where('uid', $user->id)->first();
+        if (!$staff) {
+            return response()->json(['message' => 'Staff record not found.'], 404);
+        }
+
+        $roleMap = Role::where('store_id', (string) ($staff->store_id ?? ''))
+            ->pluck('name', 'id');
+        $roleName = (string) ($roleMap[(int) ($staff->role_id ?? 0)] ?? '');
+
+        $store = Store::find($staff->store_id);
+
+        $ordersBase = Order::query()
+            ->where('staff_id', $user->id)
+            ->where('store_id', (int) ($staff->store_id ?? 0));
+        $totalOrders = (clone $ordersBase)->count();
+        $pendingOrders = (clone $ordersBase)
+            ->whereIn(DB::raw('LOWER(status)'), ['pending', 'on hold', 'hold', 'new'])
+            ->count();
+        $processingOrders = (clone $ordersBase)
+            ->whereIn(DB::raw('LOWER(status)'), ['processing', 'shipping', 'confirmed'])
+            ->count();
+
+        return response()->json([
+            'staff' => [
+                'id' => (int) $staff->id,
+                'name' => (string) ($staff->name ?? ''),
+                'username' => (string) ($staff->username ?? ''),
+                'email' => (string) ($staff->email ?? ''),
+                'phone' => (string) ($staff->phone ?? ''),
+                'status' => strtolower((string) ($staff->status ?? 'inactive')) === 'active' ? 'active' : 'inactive',
+                'role_name' => $roleName,
+                'joined' => $staff->created_at ? Carbon::parse($staff->created_at)->format('d M Y') : '',
+            ],
+            'store' => $store ? [
+                'id' => (int) $store->id,
+                'name' => (string) ($store->name ?? ''),
+                'url' => (string) ($store->url ?? ''),
+            ] : null,
+            'stats' => [
+                'total_orders' => $totalOrders,
+                'pending_orders' => $pendingOrders,
+                'processing_orders' => $processingOrders,
+            ],
+        ]);
+    }
+
+    public function superstaffDashboard(Request $request): JsonResponse
+    {
+        $user = $request->user();
+        if (!$user) {
+            return response()->json(['message' => 'Unauthenticated.'], 401);
+        }
+
+        $staff = Superstaff::with('role:id,name')->where('uid', $user->id)->first();
+        if (!$staff) {
+            return response()->json(['message' => 'Superstaff record not found.'], 404);
+        }
+
+        $balance = (float) SuperstaffSalesCommissionBalance::getSellerCommissionBalance($staff->id);
+        $managedSites = Websitesetup::where('editor', $staff->uid)->count();
+
+        return response()->json([
+            'staff' => [
+                'id' => (int) $staff->id,
+                'name' => (string) ($staff->name ?? ''),
+                'username' => (string) ($staff->username ?? ''),
+                'email' => (string) ($staff->email ?? ''),
+                'phone' => (string) ($staff->phone ?? ''),
+                'status' => (string) ($staff->status ?? 'inactive'),
+                'role_name' => (string) ($staff->role?->name ?? ''),
+                'new_commission' => (string) ($staff->new_commission ?? '0'),
+                'renew_commission' => (string) ($staff->renew_commission ?? '0'),
+                'setup_commission' => (string) ($staff->setup_commission ?? '0'),
+                'joined' => $staff->created_at ? Carbon::parse($staff->created_at)->format('d M Y') : '',
+            ],
+            'stats' => [
+                'managed_sites' => $managedSites,
+                'commission_balance' => round($balance, 2),
+            ],
         ]);
     }
 
@@ -4349,6 +4595,7 @@ class AdminReactController extends Controller
         if ($this->tableHasColumn('products', 'variant_payload')) {
             $variantPayloadRaw = $request->input('variant_payload');
             $row->variant_payload = is_string($variantPayloadRaw) ? $variantPayloadRaw : json_encode($variantPayloadRaw ?: []);
+            $this->syncProductQuantityFromVariantSources($row);
         }
 
         $row->uid = $user->id;
@@ -4595,6 +4842,10 @@ class AdminReactController extends Controller
         if ($this->tableHasColumn('products', 'variant_payload')) {
             $variantPayloadRaw = $request->input('variant_payload');
             $row->variant_payload = is_string($variantPayloadRaw) ? $variantPayloadRaw : json_encode($variantPayloadRaw ?: []);
+            $row->load(['variant' => function ($q) {
+                $q->select('id', 'pid', 'quantity');
+            }]);
+            $this->syncProductQuantityFromVariantSources($row);
         }
         if ($this->tableHasColumn('products', 'editor')) {
             $row->editor = $user->id;
@@ -4646,6 +4897,232 @@ class AdminReactController extends Controller
         return response()->json(['success' => true, 'id' => $id]);
     }
 
+    private function normalizeVariantQuantity($value): int
+    {
+        if ($value === null || $value === '') {
+            return 0;
+        }
+
+        if (is_numeric($value)) {
+            return max(0, (int) floor((float) $value));
+        }
+
+        return 0;
+    }
+
+    private function sumVariantPayloadQuantities($variantPayload): int
+    {
+        if ($variantPayload === null || $variantPayload === '') {
+            return 0;
+        }
+
+        $payload = is_array($variantPayload)
+            ? $variantPayload
+            : json_decode((string) $variantPayload, true);
+        if (!is_array($payload)) {
+            return 0;
+        }
+
+        $total = 0;
+        $mode = (string) ($payload['mode'] ?? 'color_size');
+        if ($mode === 'color_size') {
+            foreach ((array) ($payload['colorSizeGroups'] ?? []) as $group) {
+                foreach ((array) ($group['sizeRows'] ?? []) as $row) {
+                    $total += $this->normalizeVariantQuantity($row['quantity'] ?? 0);
+                }
+            }
+            return $total;
+        }
+        if ($mode === 'color_only') {
+            foreach ((array) ($payload['colorOnlyRows'] ?? []) as $row) {
+                $total += $this->normalizeVariantQuantity($row['quantity'] ?? 0);
+            }
+            return $total;
+        }
+        if ($mode === 'size_only') {
+            foreach ((array) ($payload['sizeOnlyRows'] ?? []) as $row) {
+                $total += $this->normalizeVariantQuantity($row['quantity'] ?? 0);
+            }
+            return $total;
+        }
+        if ($mode === 'unit') {
+            foreach ((array) ($payload['unitRows'] ?? []) as $row) {
+                $total += $this->normalizeVariantQuantity($row['quantity'] ?? 0);
+            }
+        }
+
+        return $total;
+    }
+
+    private function buildInventoryVariantsFromDatabase(Product $product): \Illuminate\Support\Collection
+    {
+        return collect($product->variant ?? [])->map(function ($variant) {
+            return [
+                'id' => (int) ($variant->id ?? 0),
+                'image_url' => !empty($variant->image) ? $this->resolveProductImageTokenPublicUrl((string) $variant->image) : null,
+                'color' => (string) ($variant->color ?? ''),
+                'size' => (string) ($variant->size ?? ''),
+                'unit' => (string) ($variant->unit ?? ''),
+                'volume' => (string) ($variant->volume ?? ''),
+                'price' => (float) ($variant->additional_price ?? 0),
+                'quantity' => $this->normalizeVariantQuantity($variant->quantity ?? 0),
+            ];
+        })->values();
+    }
+
+    private function buildInventoryVariantsFromPayload(
+        $variantPayload,
+        array $colorLookup,
+        array $sizeLookup,
+        array $unitLookup
+    ): \Illuminate\Support\Collection {
+        if ($variantPayload === null || $variantPayload === '') {
+            return collect();
+        }
+
+        $pl = is_array($variantPayload)
+            ? $variantPayload
+            : json_decode((string) $variantPayload, true);
+        if (!is_array($pl)) {
+            return collect();
+        }
+
+        $plMode = (string) ($pl['mode'] ?? 'color_size');
+        $plVariants = [];
+        $tempId = -1;
+        $resolveImg = function (string $imgId): ?string {
+            if ($imgId === '') {
+                return null;
+            }
+            $path = preg_replace('/^stored-/', '', $imgId);
+            return $path !== '' ? $this->resolveProductImageTokenPublicUrl($path) : null;
+        };
+
+        if ($plMode === 'color_size') {
+            foreach ($pl['colorSizeGroups'] ?? [] as $g) {
+                $colorName = $colorLookup[(int) ($g['colorId'] ?? 0)] ?? '';
+                $groupImg = $resolveImg((string) ($g['imageId'] ?? ''));
+                foreach ($g['sizeRows'] ?? [] as $r) {
+                    $plVariants[] = [
+                        'id' => $tempId--,
+                        'image_url' => $resolveImg((string) ($r['imageId'] ?? '')) ?? $groupImg,
+                        'color' => $colorName,
+                        'size' => $sizeLookup[(int) ($r['sizeId'] ?? 0)] ?? '',
+                        'unit' => '',
+                        'volume' => '',
+                        'price' => (float) ($r['price'] ?? 0),
+                        'quantity' => $this->normalizeVariantQuantity($r['quantity'] ?? 0),
+                    ];
+                }
+            }
+        } elseif ($plMode === 'color_only') {
+            foreach ($pl['colorOnlyRows'] ?? [] as $r) {
+                $plVariants[] = [
+                    'id' => $tempId--,
+                    'image_url' => $resolveImg((string) ($r['imageId'] ?? '')),
+                    'color' => $colorLookup[(int) ($r['colorId'] ?? 0)] ?? '',
+                    'size' => '',
+                    'unit' => '',
+                    'volume' => '',
+                    'price' => (float) ($r['price'] ?? 0),
+                    'quantity' => $this->normalizeVariantQuantity($r['quantity'] ?? 0),
+                ];
+            }
+        } elseif ($plMode === 'size_only') {
+            foreach ($pl['sizeOnlyRows'] ?? [] as $r) {
+                $plVariants[] = [
+                    'id' => $tempId--,
+                    'image_url' => $resolveImg((string) ($r['imageId'] ?? '')),
+                    'color' => '',
+                    'size' => $sizeLookup[(int) ($r['sizeId'] ?? 0)] ?? '',
+                    'unit' => '',
+                    'volume' => '',
+                    'price' => (float) ($r['price'] ?? 0),
+                    'quantity' => $this->normalizeVariantQuantity($r['quantity'] ?? 0),
+                ];
+            }
+        } elseif ($plMode === 'unit') {
+            foreach ($pl['unitRows'] ?? [] as $r) {
+                $plVariants[] = [
+                    'id' => $tempId--,
+                    'image_url' => $resolveImg((string) ($r['imageId'] ?? '')),
+                    'color' => '',
+                    'size' => '',
+                    'unit' => $unitLookup[(int) ($r['unitId'] ?? 0)] ?? '',
+                    'volume' => (string) ($r['volume'] ?? ''),
+                    'price' => (float) ($r['price'] ?? 0),
+                    'quantity' => $this->normalizeVariantQuantity($r['quantity'] ?? 0),
+                ];
+            }
+        }
+
+        return collect($plVariants);
+    }
+
+    private function buildInventoryVariants(
+        Product $product,
+        array $colorLookup,
+        array $sizeLookup,
+        array $unitLookup,
+        bool $hasVariantPayloadColumn
+    ): \Illuminate\Support\Collection {
+        $dbVariants = $this->buildInventoryVariantsFromDatabase($product);
+        $dbTotal = (int) $dbVariants->sum(fn ($row) => (int) ($row['quantity'] ?? 0));
+
+        if (!$hasVariantPayloadColumn || empty($product->variant_payload)) {
+            return $dbVariants;
+        }
+
+        $payloadVariants = $this->buildInventoryVariantsFromPayload(
+            $product->variant_payload,
+            $colorLookup,
+            $sizeLookup,
+            $unitLookup,
+        );
+        if ($payloadVariants->isEmpty()) {
+            return $dbVariants;
+        }
+
+        $payloadTotal = (int) $payloadVariants->sum(fn ($row) => (int) ($row['quantity'] ?? 0));
+        if ($dbVariants->isEmpty() || $payloadTotal > $dbTotal) {
+            return $payloadVariants;
+        }
+
+        return $dbVariants;
+    }
+
+    private function resolveInventoryProductQuantity(int $baseQuantity, $variants, $variantPayload = null): int
+    {
+        $resolved = max(0, $this->normalizeVariantQuantity($baseQuantity));
+
+        if ($variants instanceof \Illuminate\Support\Collection && $variants->isNotEmpty()) {
+            $variantTotal = (int) $variants->sum(fn ($row) => (int) ($row['quantity'] ?? 0));
+            $resolved = max($resolved, $variantTotal);
+        }
+
+        $payloadTotal = $this->sumVariantPayloadQuantities($variantPayload);
+        if ($payloadTotal > 0) {
+            $resolved = max($resolved, $payloadTotal);
+        }
+
+        return $resolved;
+    }
+
+    private function syncProductQuantityFromVariantSources(Product $row): void
+    {
+        if (!$this->tableHasColumn('products', 'quantity')) {
+            return;
+        }
+
+        $baseQuantity = $this->normalizeVariantQuantity($row->quantity ?? 0);
+        $variantTableQty = 0;
+        if ($row->relationLoaded('variant')) {
+            $variantTableQty = (int) collect($row->variant ?? [])->sum(fn ($variant) => $this->normalizeVariantQuantity($variant->quantity ?? 0));
+        }
+        $payloadQty = $this->sumVariantPayloadQuantities($row->variant_payload ?? null);
+        $row->quantity = (string) max($baseQuantity, $variantTableQty, $payloadQty);
+    }
+
     public function inventoryStockList(Request $request): JsonResponse
     {
         $ctx = $this->resolveReactStoreContext($request);
@@ -4672,10 +5149,23 @@ class AdminReactController extends Controller
             ->with(['variant' => function ($q) {
                 $q->select('id', 'pid', 'image', 'color', 'size', 'unit', 'volume', 'additional_price', 'quantity');
             }])
+            ->leftJoinSub(
+                DB::table('veriants')
+                    ->selectRaw('pid as product_id, SUM(CAST(COALESCE(quantity, 0) AS SIGNED)) as variant_qty')
+                    ->groupBy('pid'),
+                'inventory_variant_stock',
+                function ($join) {
+                    $join->on('inventory_variant_stock.product_id', '=', 'products.id');
+                }
+            )
             ->where('store_id', (string) $store->id)
             ->where('customer_id', (string) $customer->id)
             ->where('status', '!=', 'RecycleBin')
-            ->orderByDesc('id');
+            ->select('products.*')
+            ->selectRaw('COALESCE(inventory_variant_stock.variant_qty, 0) as variant_stock_qty')
+            ->orderByDesc('products.id');
+
+        $effectiveQtyExpression = 'GREATEST(CAST(COALESCE(products.quantity, 0) AS SIGNED), CAST(COALESCE(inventory_variant_stock.variant_qty, 0) AS SIGNED))';
 
         if ($search !== '') {
             $query->where(function ($subQuery) use ($search) {
@@ -4688,14 +5178,14 @@ class AdminReactController extends Controller
             $query->where('status', $status);
         }
         if ($stockState === 'in') {
-            $query->whereRaw('CAST(COALESCE(quantity, 0) AS SIGNED) > 0');
+            $query->whereRaw("{$effectiveQtyExpression} > 0");
         } elseif ($stockState === 'out') {
-            $query->whereRaw('CAST(COALESCE(quantity, 0) AS SIGNED) <= 0');
+            $query->whereRaw("{$effectiveQtyExpression} <= 0");
         } elseif ($stockState === 'low') {
-            $query->whereRaw('CAST(COALESCE(quantity, 0) AS SIGNED) > 0');
-            $query->whereRaw('CAST(COALESCE(quantity, 0) AS SIGNED) <= ?', [$stockOutQty]);
+            $query->whereRaw("{$effectiveQtyExpression} > 0");
+            $query->whereRaw("{$effectiveQtyExpression} <= ?", [$stockOutQty]);
         } elseif ($stockState === 'alert') {
-            $query->whereRaw('CAST(COALESCE(quantity, 0) AS SIGNED) <= ?', [$stockOutQty]);
+            $query->whereRaw("{$effectiveQtyExpression} <= ?", [$stockOutQty]);
         }
 
         if ($fromDate !== '') {
@@ -4720,6 +5210,7 @@ class AdminReactController extends Controller
                 $join->on('sales_agg.product_id', '=', 'products.id');
             });
             $query->select('products.*');
+            $query->selectRaw('COALESCE(inventory_variant_stock.variant_qty, 0) as variant_stock_qty');
             $query->selectRaw('COALESCE(sales_agg.sold_qty, 0) as sold_qty');
             $query->orderBy('sold_qty', $sellingType === 'higher' ? 'desc' : 'asc');
         }
@@ -4737,7 +5228,6 @@ class AdminReactController extends Controller
             $allUnitIds = [];
             foreach ($paginator->items() as $product) {
                 if (empty($product->variant_payload)) continue;
-                if ($product->variant && !$product->variant->isEmpty()) continue;
                 $pl = json_decode((string) $product->variant_payload, true);
                 if (!is_array($pl)) continue;
                 $plMode = $pl['mode'] ?? 'color_size';
@@ -4777,98 +5267,24 @@ class AdminReactController extends Controller
         }
 
         $items = collect($paginator->items())->map(function (Product $product) use ($stockOutQty, $module118Enabled, $colorLookup, $sizeLookup, $unitLookup, $hasVariantPayloadColumn) {
-            $quantity = (int) ($product->quantity ?? 0);
+            $soldQty = (int) ($product->sold_qty ?? 0);
+
+            $variants = $this->buildInventoryVariants(
+                $product,
+                $colorLookup,
+                $sizeLookup,
+                $unitLookup,
+                $hasVariantPayloadColumn,
+            );
+
+            $quantity = $this->resolveInventoryProductQuantity(
+                $this->normalizeVariantQuantity($product->quantity ?? 0),
+                $variants,
+                $hasVariantPayloadColumn ? ($product->variant_payload ?? null) : null,
+            );
             $stockLabel = $quantity <= 0
                 ? 'Out of stock'
                 : ($quantity <= $stockOutQty ? 'Low stock' : 'In stock');
-            $soldQty = (int) ($product->sold_qty ?? 0);
-
-            $variants = collect($product->variant ?? [])->map(function ($variant) {
-                return [
-                    'id' => (int) ($variant->id ?? 0),
-                    'image_url' => !empty($variant->image) ? $this->resolveProductImageTokenPublicUrl((string) $variant->image) : null,
-                    'color' => (string) ($variant->color ?? ''),
-                    'size' => (string) ($variant->size ?? ''),
-                    'unit' => (string) ($variant->unit ?? ''),
-                    'volume' => (string) ($variant->volume ?? ''),
-                    'price' => (float) ($variant->additional_price ?? 0),
-                    'quantity' => (int) ($variant->quantity ?? 0),
-                ];
-            })->values();
-
-            // Fallback: build variants from variant_payload for React-admin products (not in veriants table)
-            if ($variants->isEmpty() && $hasVariantPayloadColumn && !empty($product->variant_payload)) {
-                $pl = json_decode((string) $product->variant_payload, true);
-                if (is_array($pl)) {
-                    $plMode = $pl['mode'] ?? 'color_size';
-                    $plVariants = [];
-                    $tempId = -1;
-                    $resolveImg = function (string $imgId): ?string {
-                        if ($imgId === '') return null;
-                        $path = preg_replace('/^stored-/', '', $imgId);
-                        return $path !== '' ? $this->resolveProductImageTokenPublicUrl($path) : null;
-                    };
-                    if ($plMode === 'color_size') {
-                        foreach ($pl['colorSizeGroups'] ?? [] as $g) {
-                            $colorName = $colorLookup[(int) ($g['colorId'] ?? 0)] ?? '';
-                            $groupImg = $resolveImg((string) ($g['imageId'] ?? ''));
-                            foreach ($g['sizeRows'] ?? [] as $r) {
-                                $sizeName = $sizeLookup[(int) ($r['sizeId'] ?? 0)] ?? '';
-                                $plVariants[] = [
-                                    'id' => $tempId--,
-                                    'image_url' => $resolveImg((string) ($r['imageId'] ?? '')) ?? $groupImg,
-                                    'color' => $colorName,
-                                    'size' => $sizeName,
-                                    'unit' => '',
-                                    'volume' => '',
-                                    'price' => (float) ($r['price'] ?? 0),
-                                    'quantity' => (int) ($r['quantity'] ?? 0),
-                                ];
-                            }
-                        }
-                    } elseif ($plMode === 'color_only') {
-                        foreach ($pl['colorOnlyRows'] ?? [] as $r) {
-                            $plVariants[] = [
-                                'id' => $tempId--,
-                                'image_url' => $resolveImg((string) ($r['imageId'] ?? '')),
-                                'color' => $colorLookup[(int) ($r['colorId'] ?? 0)] ?? '',
-                                'size' => '',
-                                'unit' => '',
-                                'volume' => '',
-                                'price' => (float) ($r['price'] ?? 0),
-                                'quantity' => (int) ($r['quantity'] ?? 0),
-                            ];
-                        }
-                    } elseif ($plMode === 'size_only') {
-                        foreach ($pl['sizeOnlyRows'] ?? [] as $r) {
-                            $plVariants[] = [
-                                'id' => $tempId--,
-                                'image_url' => $resolveImg((string) ($r['imageId'] ?? '')),
-                                'color' => '',
-                                'size' => $sizeLookup[(int) ($r['sizeId'] ?? 0)] ?? '',
-                                'unit' => '',
-                                'volume' => '',
-                                'price' => (float) ($r['price'] ?? 0),
-                                'quantity' => (int) ($r['quantity'] ?? 0),
-                            ];
-                        }
-                    } elseif ($plMode === 'unit') {
-                        foreach ($pl['unitRows'] ?? [] as $r) {
-                            $plVariants[] = [
-                                'id' => $tempId--,
-                                'image_url' => $resolveImg((string) ($r['imageId'] ?? '')),
-                                'color' => '',
-                                'size' => '',
-                                'unit' => $unitLookup[(int) ($r['unitId'] ?? 0)] ?? '',
-                                'volume' => (string) ($r['volume'] ?? ''),
-                                'price' => (float) ($r['price'] ?? 0),
-                                'quantity' => (int) ($r['quantity'] ?? 0),
-                            ];
-                        }
-                    }
-                    $variants = collect($plVariants);
-                }
-            }
 
             return [
                 'id' => (int) $product->id,
@@ -5091,7 +5507,7 @@ class AdminReactController extends Controller
         $payload = $request->validate([
             'name' => ['required', 'string', 'max:255'],
             'company_name' => ['nullable', 'string', 'max:255'],
-            'phone' => ['required', 'string', 'max:120'],
+            'phone' => AdminContactValidation::phoneRules(true, 120),
             'address' => ['nullable', 'string', 'max:1000'],
         ]);
 
@@ -5127,7 +5543,7 @@ class AdminReactController extends Controller
         $payload = $request->validate([
             'name' => ['required', 'string', 'max:255'],
             'company_name' => ['nullable', 'string', 'max:255'],
-            'phone' => ['required', 'string', 'max:120'],
+            'phone' => AdminContactValidation::phoneRules(true, 120),
             'address' => ['nullable', 'string', 'max:1000'],
         ]);
 
@@ -5432,8 +5848,8 @@ class AdminReactController extends Controller
             'name' => ['required', 'string', 'max:255'],
             'username' => ['required', 'string', 'max:255'],
             'password' => ['required', 'string', 'min:4', 'max:255'],
-            'email' => ['nullable', 'email', 'max:255'],
-            'phone' => ['nullable', 'string', 'max:120'],
+            'email' => AdminContactValidation::emailRules(false, 255),
+            'phone' => AdminContactValidation::phoneRules(false, 120),
             'address' => ['nullable', 'string', 'max:1000'],
             'status' => ['nullable', 'in:active,inactive'],
             'role_id' => ['nullable', 'integer'],
@@ -5520,8 +5936,8 @@ class AdminReactController extends Controller
             'name' => ['required', 'string', 'max:255'],
             'username' => ['required', 'string', 'max:255'],
             'password' => ['nullable', 'string', 'min:4', 'max:255'],
-            'email' => ['nullable', 'email', 'max:255'],
-            'phone' => ['nullable', 'string', 'max:120'],
+            'email' => AdminContactValidation::emailRules(false, 255),
+            'phone' => AdminContactValidation::phoneRules(false, 120),
             'address' => ['nullable', 'string', 'max:1000'],
             'status' => ['nullable', 'in:active,inactive'],
             'role_id' => ['nullable', 'integer'],
@@ -6883,10 +7299,10 @@ class AdminReactController extends Controller
         $extension = pathinfo($filename, PATHINFO_EXTENSION);
         $basename = pathinfo($filename, PATHINFO_FILENAME);
         $candidate = $filename;
-        $counter = 1;
+        $counter = 2;
 
         while ($disk->exists(trim($dir, '/') . '/' . $candidate)) {
-            $suffix = ' (' . $counter . ')';
+            $suffix = '-' . $counter;
             $candidate = $extension !== ''
                 ? $basename . $suffix . '.' . $extension
                 : $basename . $suffix;
@@ -6905,10 +7321,10 @@ class AdminReactController extends Controller
         $extension = pathinfo($filename, PATHINFO_EXTENSION);
         $basename = pathinfo($filename, PATHINFO_FILENAME);
         $candidate = $filename;
-        $counter = 1;
+        $counter = 2;
 
         while (file_exists(rtrim($absoluteDir, DIRECTORY_SEPARATOR) . DIRECTORY_SEPARATOR . $candidate)) {
-            $suffix = ' (' . $counter . ')';
+            $suffix = '-' . $counter;
             $candidate = $extension !== ''
                 ? $basename . $suffix . '.' . $extension
                 : $basename . $suffix;
@@ -6920,16 +7336,9 @@ class AdminReactController extends Controller
 
     private function mediaLibraryFileUrl(string $path, ?string $storeId = null): string
     {
-        $query = 'path=' . rawurlencode($path);
         $cleanPath = $this->normalizeMediaLibraryDiskPath($path);
-        if (Str::startsWith($cleanPath, 'image-library/superadmin/')) {
-            $query .= '&scope=superadmin';
-        }
-        $storeId = trim((string) $storeId);
-        if ($storeId !== '') {
-            $query .= '&store_id=' . rawurlencode($storeId);
-        }
-        return url('/react-admin-api/media-library/file?' . $query);
+
+        return rtrim($this->assetOrigin(), '/') . '/storage/' . ltrim($cleanPath, '/');
     }
 
     private function mediaStoreIdFromPath(string $path): ?string
@@ -7094,7 +7503,14 @@ class AdminReactController extends Controller
             $query->where('usage_type', $usageType);
         }
         if ($categoryId !== '' && ctype_digit($categoryId)) {
-            $query->where('business_category_id', (int) $categoryId);
+            $filterCategoryId = (int) $categoryId;
+            $query->where(function ($q) use ($filterCategoryId) {
+                $q->where('business_category_id', $filterCategoryId);
+                if (Schema::hasColumn('ai_seed_image_libraries', 'business_category_ids')) {
+                    $q->orWhereJsonContains('business_category_ids', $filterCategoryId)
+                        ->orWhereJsonContains('business_category_ids', (string) $filterCategoryId);
+                }
+            });
         }
         if ($search !== '') {
             $query->where(function ($q) use ($search) {
@@ -7130,6 +7546,8 @@ class AdminReactController extends Controller
         $payload = $request->validate([
             'image' => ['nullable', 'file', 'image', 'mimes:jpeg,png,jpg,webp', 'max:10240'],
             'business_category_id' => ['nullable', 'integer', 'exists:business_categories,id'],
+            'business_category_ids' => ['nullable', 'array', 'max:30'],
+            'business_category_ids.*' => ['integer', 'exists:business_categories,id'],
             'usage_type' => ['required', 'string', 'in:product,category,slider,banner'],
             'category_slug' => ['nullable', 'string', 'max:120'],
             'subcategory_slug' => ['nullable', 'string', 'max:120'],
@@ -7169,8 +7587,9 @@ class AdminReactController extends Controller
             return response()->json(['message' => 'An image file or media library path is required.'], 422);
         }
 
-        $category = !empty($payload['business_category_id'])
-            ? BusinessCategory::query()->find((int) $payload['business_category_id'])
+        $businessCategoryIds = $this->normalizeAiSeedBusinessCategoryIds($payload);
+        $category = !empty($businessCategoryIds)
+            ? BusinessCategory::query()->find((int) $businessCategoryIds[0])
             : null;
 
         $file = $request->file('image');
@@ -7185,7 +7604,7 @@ class AdminReactController extends Controller
         $directory = "ai-seed-library/{$usageType}/{$businessSlug}/{$categorySlug}/{$subcategorySlug}";
         $path = $file->storeAs($directory, $filename, 'public');
 
-        $row = AiSeedImageLibrary::query()->create([
+        $rowPayload = [
             'business_category_id' => $category?->id,
             'business_category_name' => $category?->name,
             'category_slug' => $categorySlug,
@@ -7199,7 +7618,10 @@ class AdminReactController extends Controller
             'alt_text' => trim((string) ($payload['alt_text'] ?? '')),
             'tags' => trim((string) ($payload['tags'] ?? '')),
             'status' => array_key_exists('status', $payload) ? (bool) $payload['status'] : true,
-        ]);
+        ];
+        $this->setAiSeedBusinessCategoryIdsPayload($rowPayload, $businessCategoryIds);
+
+        $row = AiSeedImageLibrary::query()->create($rowPayload);
 
         return response()->json([
             'message' => 'Seed image uploaded successfully.',
@@ -7209,8 +7631,9 @@ class AdminReactController extends Controller
 
     private function superadminStoreDefaultImageLibraryImportFromMediaPaths(array $payload, array $paths): JsonResponse
     {
-        $category = !empty($payload['business_category_id'])
-            ? BusinessCategory::query()->find((int) $payload['business_category_id'])
+        $businessCategoryIds = $this->normalizeAiSeedBusinessCategoryIds($payload);
+        $category = !empty($businessCategoryIds)
+            ? BusinessCategory::query()->find((int) $businessCategoryIds[0])
             : null;
 
         $items = [];
@@ -7334,7 +7757,7 @@ class AdminReactController extends Controller
 
         $originalName = basename($cleanSource);
 
-        return AiSeedImageLibrary::query()->create([
+        $rowPayload = [
             'business_category_id' => $category?->id,
             'business_category_name' => $category?->name,
             'category_slug' => $categorySlug,
@@ -7348,7 +7771,34 @@ class AdminReactController extends Controller
             'alt_text' => trim((string) ($payload['alt_text'] ?? '')),
             'tags' => trim((string) ($payload['tags'] ?? '')),
             'status' => array_key_exists('status', $payload) ? (bool) $payload['status'] : true,
-        ]);
+        ];
+        $this->setAiSeedBusinessCategoryIdsPayload($rowPayload, $this->normalizeAiSeedBusinessCategoryIds($payload));
+
+        return AiSeedImageLibrary::query()->create($rowPayload);
+    }
+
+    private function normalizeAiSeedBusinessCategoryIds(array $payload): array
+    {
+        $ids = [];
+        foreach ((array) ($payload['business_category_ids'] ?? []) as $id) {
+            if (is_numeric($id) && (int) $id > 0) {
+                $ids[] = (int) $id;
+            }
+        }
+
+        $singleId = $payload['business_category_id'] ?? null;
+        if (is_numeric($singleId) && (int) $singleId > 0) {
+            array_unshift($ids, (int) $singleId);
+        }
+
+        return array_values(array_unique($ids));
+    }
+
+    private function setAiSeedBusinessCategoryIdsPayload(array &$payload, array $businessCategoryIds): void
+    {
+        if (Schema::hasColumn('ai_seed_image_libraries', 'business_category_ids')) {
+            $payload['business_category_ids'] = array_values(array_unique(array_filter(array_map('intval', $businessCategoryIds))));
+        }
     }
 
     public function superadminStoreDefaultImageLibraryUpdate(Request $request, int $id): JsonResponse
@@ -7364,6 +7814,8 @@ class AdminReactController extends Controller
 
         $payload = $request->validate([
             'business_category_id' => ['nullable', 'integer', 'exists:business_categories,id'],
+            'business_category_ids' => ['nullable', 'array', 'max:30'],
+            'business_category_ids.*' => ['integer', 'exists:business_categories,id'],
             'usage_type' => ['nullable', 'string', 'in:product,category,slider,banner'],
             'category_slug' => ['nullable', 'string', 'max:120'],
             'subcategory_slug' => ['nullable', 'string', 'max:120'],
@@ -7373,11 +7825,14 @@ class AdminReactController extends Controller
             'status' => ['nullable', 'boolean'],
         ]);
 
-        if (array_key_exists('business_category_id', $payload)) {
-            $bcId = $payload['business_category_id'];
-            $category = $bcId ? BusinessCategory::query()->find((int) $bcId) : null;
+        if (array_key_exists('business_category_id', $payload) || array_key_exists('business_category_ids', $payload)) {
+            $businessCategoryIds = $this->normalizeAiSeedBusinessCategoryIds($payload);
+            $category = !empty($businessCategoryIds) ? BusinessCategory::query()->find((int) $businessCategoryIds[0]) : null;
             $row->business_category_id = $category?->id;
             $row->business_category_name = $category?->name;
+            if (Schema::hasColumn('ai_seed_image_libraries', 'business_category_ids')) {
+                $row->business_category_ids = $businessCategoryIds;
+            }
         }
 
         if (array_key_exists('usage_type', $payload) && $payload['usage_type'] !== null && $payload['usage_type'] !== '') {
@@ -7475,6 +7930,9 @@ class AdminReactController extends Controller
         return [
             'id' => (int) $row->id,
             'business_category_id' => $row->business_category_id,
+            'business_category_ids' => Schema::hasColumn('ai_seed_image_libraries', 'business_category_ids')
+                ? array_values(array_filter(array_map('intval', (array) ($row->business_category_ids ?: []))))
+                : ($row->business_category_id ? [(int) $row->business_category_id] : []),
             'business_category_name' => (string) ($row->business_category_name ?? ''),
             'category_slug' => (string) ($row->category_slug ?? ''),
             'subcategory_slug' => (string) ($row->subcategory_slug ?? ''),
@@ -7679,7 +8137,7 @@ class AdminReactController extends Controller
             'custom_domain' => ['nullable', 'string', 'max:255'],
             'currency' => ['required', 'integer', 'exists:currencies,id'],
             'package_type' => ['nullable', 'string', 'max:20'],
-            'phone' => ['nullable', 'string', 'max:30'],
+            'phone' => AdminContactValidation::phoneRules(false, 30),
         ]);
 
         $packageType = $validated['package_type'] ?? 'ecw';
@@ -7730,6 +8188,11 @@ class AdminReactController extends Controller
         }
 
         return DB::transaction(function () use ($request, $user, $storeName, $slug, $storeUrl, $currencyId, $typeId, $customDomain) {
+            $trialDays = $this->superadminTrialPeriodDays();
+            $trialPlanId = $this->currentWebsiteTrialPlanId();
+            $trialStartsAt = Carbon::now();
+            $trialExpiresAt = $trialStartsAt->copy()->addDays($trialDays);
+
             $customer = Customer::query()->firstOrNew(['uid' => (string) $user->id]);
             if (!$customer->exists) {
                 if ($this->tableHasColumn('customers', 'name')) $customer->name = $user->name ?? $storeName;
@@ -7737,7 +8200,18 @@ class AdminReactController extends Controller
                 if ($this->tableHasColumn('customers', 'template_id')) $customer->template_id = 1;
             }
             if ($this->tableHasColumn('customers', 'company_name')) $customer->company_name = $storeName;
-            if ($this->tableHasColumn('customers', 'plan_status')) $customer->plan_status = $customer->plan_status ?: 'inactive';
+            $currentCustomerPlanId = strtoupper(trim((string) ($customer->plan_id ?? '')));
+            if ($trialPlanId && $this->tableHasColumn('customers', 'plan_id') && in_array($currentCustomerPlanId, ['', '0', 'NULL'], true)) {
+                $customer->plan_id = $trialPlanId;
+            }
+            $currentCustomerPurchaseDate = strtoupper(trim((string) ($customer->purchase_date ?? '')));
+            if ($this->tableHasColumn('customers', 'purchase_date') && in_array($currentCustomerPurchaseDate, ['', 'NULL'], true)) {
+                $customer->purchase_date = $trialStartsAt->toDateString();
+            }
+            if ($this->tableHasColumn('customers', 'expiry_date')) {
+                $customer->expiry_date = $trialExpiresAt->toDateString();
+            }
+            if ($this->tableHasColumn('customers', 'plan_status')) $customer->plan_status = 'active';
             $customer->save();
 
             $store = new Store();
@@ -7753,7 +8227,10 @@ class AdminReactController extends Controller
             if ($this->tableHasColumn('stores', 'paid_registration')) $store->paid_registration = (int) ($user->paid_registration ?? 0);
             if ($this->tableHasColumn('stores', 'template_id')) $store->template_id = 1;
             if ($this->tableHasColumn('stores', 'currency')) $store->currency = $currencyId ?: 1;
-            if ($this->tableHasColumn('stores', 'purchase_date')) $store->purchase_date = now()->toDateString();
+            if ($trialPlanId && $this->tableHasColumn('stores', 'plan_id')) $store->plan_id = $trialPlanId;
+            if ($this->tableHasColumn('stores', 'plan_status')) $store->plan_status = 'active';
+            if ($this->tableHasColumn('stores', 'purchase_date')) $store->purchase_date = $trialStartsAt->toDateString();
+            if ($this->tableHasColumn('stores', 'expiry_date')) $store->expiry_date = $trialExpiresAt->toDateString();
             if ($this->tableHasColumn('stores', 'auth_type')) $store->auth_type = 'EmailEasyOrder';
             $store->save();
 
@@ -7794,6 +8271,10 @@ class AdminReactController extends Controller
                     'slug' => $slug,
                     'url' => $storeUrl,
                     'custom_domain' => $customDomain,
+                    'trial_plan_id' => $trialPlanId,
+                    'trial_period_days' => $trialDays,
+                    'purchase_date' => $trialStartsAt->toDateString(),
+                    'expiry_date' => $trialExpiresAt->toDateString(),
                 ],
             ]);
         });
@@ -7908,8 +8389,8 @@ class AdminReactController extends Controller
 
         $rules = [
             'name' => ['required', 'string', 'max:100'],
-            'email' => ['required', 'string', 'email', 'max:100'],
-            'phone' => ['nullable', 'string', 'max:30'],
+            'email' => AdminContactValidation::emailRules(true, 100),
+            'phone' => AdminContactValidation::phoneRules(false, 30),
             'address' => ['nullable', 'string', 'max:255'],
             'image' => ['nullable', 'file', 'image', 'mimes:jpeg,png,jpg,webp', 'max:5120'],
             'image_path' => ['nullable', 'string', 'max:500'],
@@ -8443,7 +8924,7 @@ class AdminReactController extends Controller
 
         $store = $ctx['store'];
         $storeId = (int) ($store->id ?? 0);
-        $isTrialPlan = in_array((int) ($store->plan_id ?? 0), [6, 9], true);
+        $isTrialPlan = $this->isWebsiteTrialPlanId($store->plan_id ?? null);
         $trialAllowedModules = [107, 111, 114];
         $headerSetting = Headersetting::query()
             ->where('store_id', $storeId)
@@ -8538,7 +9019,7 @@ class AdminReactController extends Controller
 
         $store = $ctx['store'];
         $storeId = (int) ($store->id ?? 0);
-        $isTrialPlan = in_array((int) ($store->plan_id ?? 0), [6, 9], true);
+        $isTrialPlan = $this->isWebsiteTrialPlanId($store->plan_id ?? null);
         $trialAllowedModules = [107, 111, 114];
         $headerSetting = Headersetting::query()
             ->where('store_id', $storeId)
@@ -8640,7 +9121,7 @@ class AdminReactController extends Controller
 
         $modulusId = (int) $payload['modulus_id'];
 
-        $isTrialPlan = in_array((int) ($store->plan_id ?? 0), [6, 9], true);
+        $isTrialPlan = $this->isWebsiteTrialPlanId($store->plan_id ?? null);
         $ALLOW_TRIAL_MODULUS_IDS = [107, 111, 114];
         if ($isTrialPlan && !in_array($modulusId, $ALLOW_TRIAL_MODULUS_IDS, true)) {
             return response()->json([
@@ -10011,7 +10492,7 @@ class AdminReactController extends Controller
             'manual_discount_comment' => ['nullable', 'string', 'max:1000'],
             'bank_name' => ['nullable', 'string', 'max:191'],
             'account_number' => ['nullable', 'string', 'max:191'],
-            'phone' => ['nullable', 'string', 'max:100'],
+            'phone' => AdminContactValidation::phoneRules(false, 100),
             'transaction' => ['nullable', 'string', 'max:191'],
         ]);
 
@@ -10028,7 +10509,7 @@ class AdminReactController extends Controller
         $payload = $request->validate([
             'additional_paid_amount' => ['required', 'numeric', 'min:0.01'],
             'payment_method' => ['required', 'string', 'max:50'],
-            'payment_number' => ['nullable', 'string', 'max:100'],
+            'payment_number' => AdminContactValidation::phoneRules(false, 100),
             'transaction_id' => ['nullable', 'string', 'max:191'],
             'bank_name' => ['nullable', 'string', 'max:191'],
             'account_number' => ['nullable', 'string', 'max:191'],
@@ -10151,8 +10632,8 @@ class AdminReactController extends Controller
             'active_plan' => ['nullable', 'string', 'max:255'],
             'active_plan_id' => ['nullable', 'integer', 'min:1'],
             'currency_id' => ['nullable', 'integer', 'exists:currencies,id'],
-            'phone' => ['nullable', 'string', 'max:50'],
-            'email' => ['nullable', 'email', 'max:255'],
+            'phone' => AdminContactValidation::phoneRules(false, 50),
+            'email' => AdminContactValidation::emailRules(false, 255),
             'address' => ['nullable', 'string', 'max:255'],
             'custom_writing' => ['nullable', 'string', 'max:5000'],
             'tax' => ['nullable', 'numeric', 'min:0'],
@@ -10317,8 +10798,8 @@ class AdminReactController extends Controller
     {
         $payload = $request->validate([
             'name' => ['required', 'string', 'max:255'],
-            'phone' => ['required', 'string', 'regex:/^(?:\+?\d{1,3})?[1-9]\d{5,14}$/'],
-            'email' => ['nullable', 'email', 'max:255'],
+            'phone' => AdminContactValidation::phoneRules(true),
+            'email' => AdminContactValidation::emailRules(false, 255),
             'password' => ['required', 'string', 'min:8', 'confirmed'],
             'user_type' => ['required', 'in:admin,dropshipper'],
         ]);
@@ -10326,6 +10807,7 @@ class AdminReactController extends Controller
         $this->ensureRegistrationIsAvailable($payload['phone'], $payload['email'] ?? null);
 
         $otp = sixDigitRandCode();
+        $otpTarget = !empty($payload['email']) ? $payload['email'] : $payload['phone'];
 
         $request->session()->put(self::REGISTRATION_SESSION_KEY, [
             'name' => $payload['name'],
@@ -10334,15 +10816,15 @@ class AdminReactController extends Controller
             'password_hash' => Hash::make($payload['password']),
             'user_type' => $payload['user_type'],
             'otp' => $otp,
-            'target' => $payload['phone'],
+            'target' => $otpTarget,
         ]);
 
-        $this->sendOtp($payload['phone'], $otp, 'Registration', $payload['name']);
+        $this->sendOtp($otpTarget, $otp, 'Registration', $payload['name']);
 
         return response()->json([
             'success' => true,
             'message' => 'OTP sent successfully.',
-            'target' => $payload['phone'],
+            'target' => $otpTarget,
             'flow' => 'registration',
             'user_type' => $payload['user_type'],
         ]);
@@ -10426,7 +10908,7 @@ class AdminReactController extends Controller
     public function passwordRequestOtp(Request $request): JsonResponse
     {
         $validated = $request->validate([
-            'email_or_phone' => ['required', 'string'],
+            'email_or_phone' => AdminContactValidation::emailOrPhoneRules(true),
         ]);
 
         $user = User::query()
@@ -10713,12 +11195,15 @@ class AdminReactController extends Controller
         }
 
         $first = ltrim(str_replace('\\', '/', $first), '/');
-        $origin = request()->getSchemeAndHttpHost();
+        $origin = $this->assetOrigin();
 
+        if (Str::startsWith($first, 'storage/image-library/') || Str::startsWith($first, 'storage/ai-seed-library/')) {
+            return $this->mediaLibraryFileUrl(Str::after($first, 'storage/'), $this->mediaStoreIdFromPath($first));
+        }
         if (Str::startsWith($first, 'storage/')) {
             return $origin . '/' . $first;
         }
-        if (Str::startsWith($first, ['react-admin-media/', 'image-library/'])) {
+        if (Str::startsWith($first, ['react-admin-media/', 'image-library/', 'ai-seed-library/'])) {
             return $this->mediaLibraryFileUrl($first, $this->mediaStoreIdFromPath($first));
         }
 
@@ -10735,11 +11220,14 @@ class AdminReactController extends Controller
             return $clean;
         }
         $clean = ltrim(str_replace('\\', '/', $clean), '/');
-        $origin = request()->getSchemeAndHttpHost();
+        $origin = $this->assetOrigin();
+        if (Str::startsWith($clean, 'storage/image-library/') || Str::startsWith($clean, 'storage/ai-seed-library/')) {
+            return $this->mediaLibraryFileUrl(Str::after($clean, 'storage/'), $this->mediaStoreIdFromPath($clean));
+        }
         if (Str::startsWith($clean, 'storage/')) {
             return $origin . '/' . $clean;
         }
-        if (Str::startsWith($clean, ['react-admin-media/', 'image-library/'])) {
+        if (Str::startsWith($clean, ['react-admin-media/', 'image-library/', 'ai-seed-library/'])) {
             return $this->mediaLibraryFileUrl($clean, $this->mediaStoreIdFromPath($clean));
         }
         if (Str::startsWith($clean, 'assets/')) {
@@ -10767,10 +11255,16 @@ class AdminReactController extends Controller
         }
 
         $path = ltrim(str_replace('\\', '/', $image), '/');
-        $origin = request()->getSchemeAndHttpHost();
+        $origin = $this->assetOrigin();
 
+        if (Str::startsWith($path, 'storage/image-library/') || Str::startsWith($path, 'storage/ai-seed-library/')) {
+            return $this->mediaLibraryFileUrl(Str::after($path, 'storage/'), $this->mediaStoreIdFromPath($path));
+        }
         if (Str::startsWith($path, ['storage/', 'assets/'])) {
             return $origin . '/' . $path;
+        }
+        if (Str::startsWith($path, ['image-library/', 'ai-seed-library/'])) {
+            return $this->mediaLibraryFileUrl($path, $this->mediaStoreIdFromPath($path));
         }
 
         return $origin . '/assets/images/icon/' . $path;
@@ -10795,10 +11289,14 @@ class AdminReactController extends Controller
         }
 
         $path = ltrim(str_replace('\\', '/', $value), '/');
-        // In Vite proxy dev, request host may be :5173. Always prefer backend APP_URL for public asset links.
-        $configuredAppUrl = trim((string) config('app.url'));
-        $origin = rtrim($configuredAppUrl !== '' ? $configuredAppUrl : request()->getSchemeAndHttpHost(), '/');
+        $origin = $this->assetOrigin();
 
+        if (Str::startsWith($path, 'storage/image-library/') || Str::startsWith($path, 'storage/ai-seed-library/')) {
+            return $this->mediaLibraryFileUrl(Str::after($path, 'storage/'), $this->mediaStoreIdFromPath($path));
+        }
+        if (Str::startsWith($path, ['image-library/', 'ai-seed-library/'])) {
+            return $this->mediaLibraryFileUrl($path, $this->mediaStoreIdFromPath($path));
+        }
         if (Str::startsWith($path, ['storage/', 'assets/'])) {
             return $origin . '/' . $path;
         }
@@ -10985,7 +11483,13 @@ class AdminReactController extends Controller
             return $path;
         }
         $clean = ltrim(str_replace('\\', '/', $path), '/');
-        $origin = request()->getSchemeAndHttpHost();
+        $origin = $this->assetOrigin();
+        if (Str::startsWith($clean, 'storage/image-library/') || Str::startsWith($clean, 'storage/ai-seed-library/')) {
+            return $this->mediaLibraryFileUrl(Str::after($clean, 'storage/'), $this->mediaStoreIdFromPath($clean));
+        }
+        if (Str::startsWith($clean, ['image-library/', 'ai-seed-library/'])) {
+            return $this->mediaLibraryFileUrl($clean, $this->mediaStoreIdFromPath($clean));
+        }
         if (Str::startsWith($clean, ['storage/', 'assets/', 'addons/', 'modulus/'])) {
             return $origin . '/' . $clean;
         }
@@ -11763,7 +12267,83 @@ class AdminReactController extends Controller
         }
 
         $text = "eCommerceX OTP code is {$otp}";
-        SendSms($target, $text);
-        smsLogger($target, $text, "{$subject} OTP Send");
+        $this->sendWhatsAppOtp($target, $text, $subject);
+        smsLogger($target, $text, "{$subject} WhatsApp OTP Send");
+    }
+
+    private function sendWhatsAppOtp(string $target, string $text, string $subject): void
+    {
+        try {
+            $this->sendWhatsAppGatewayMessage(
+                $target,
+                $text,
+                (string) config('whatsapp_automation.otp_source_type', 'otp')
+            );
+        } catch (\Throwable $exception) {
+            Log::warning('React admin WhatsApp OTP failed.', [
+                'target' => $target,
+                'subject' => $subject,
+                'error' => $exception->getMessage(),
+            ]);
+
+            throw ValidationException::withMessages([
+                'message' => 'Unable to send OTP on WhatsApp. Please try again shortly.',
+            ]);
+        }
+    }
+
+    private function sendWhatsAppGatewayMessage(string $target, string $message, string $sourceType): array
+    {
+        $sessionId = $this->normalizeWhatsAppSessionId($target);
+
+        if (!$sessionId) {
+            throw new \InvalidArgumentException('Phone number is missing or invalid.');
+        }
+
+        $botApi = app(BotApiService::class);
+        $queued = $botApi->createOutbound([
+            'session_id' => $sessionId,
+            'bot_type' => (string) config('whatsapp_automation.otp_bot_type', 'support'),
+            'source_type' => $sourceType,
+            'message_type' => 'text',
+            'message_text' => $message,
+            'image_url' => '',
+            'scheduled_for' => null,
+        ]);
+
+        $outboundId = (int) ($queued['outbound_id'] ?? 0);
+
+        if ($outboundId > 0) {
+            try {
+                $botApi->dispatchOutbound($outboundId);
+            } catch (\Throwable $exception) {
+                Log::warning('React admin WhatsApp OTP dispatch failed after queue.', [
+                    'target' => $target,
+                    'outbound_id' => $outboundId,
+                    'error' => $exception->getMessage(),
+                ]);
+            }
+        }
+
+        return $queued;
+    }
+
+    private function normalizeWhatsAppSessionId(string $phone): ?string
+    {
+        $digits = preg_replace('/\D+/', '', $phone);
+
+        if (!$digits) {
+            return null;
+        }
+
+        if (str_starts_with($digits, '0')) {
+            $digits = '88' . $digits;
+        }
+
+        if (!str_starts_with($digits, '88') && strlen($digits) === 11) {
+            $digits = '88' . $digits;
+        }
+
+        return $digits ?: null;
     }
 }
