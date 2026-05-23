@@ -30,6 +30,7 @@ Route::prefix('react-admin-api')->group(function () {
     Route::post('/password/resend-otp', [AdminReactController::class, 'passwordResendOtp'])->middleware('guest');
     Route::post('/password/reset', [AdminReactController::class, 'passwordReset'])->middleware('guest');
     Route::get('/public/branding', [AdminReactController::class, 'publicBranding']);
+    Route::get('/public/media-library/file', [AdminReactController::class, 'publicMediaLibraryFile']);
 
     Route::prefix('public/landing')->group(function () {
         Route::post('/register', [LandingPublicApiController::class, 'register'])->middleware('guest');

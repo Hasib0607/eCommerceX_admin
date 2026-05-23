@@ -1508,6 +1508,33 @@ if (!function_exists('isPath')) {
     }
 }
 
+if (!function_exists('publicMediaLibraryUrl')) {
+    function publicMediaLibraryUrl(string $path): string
+    {
+        $cleanPath = ltrim(str_replace('\\', '/', trim($path)), '/');
+        if (str_starts_with($cleanPath, 'storage/')) {
+            $cleanPath = substr($cleanPath, strlen('storage/'));
+        }
+
+        $base = rtrim((string) config('app.url'), '/');
+        $query = http_build_query(['path' => $cleanPath]);
+
+        return ($base !== '' ? $base : '') . '/react-admin-api/public/media-library/file?' . $query;
+    }
+}
+
+if (!function_exists('isMediaLibraryPath')) {
+    function isMediaLibraryPath(string $path): bool
+    {
+        $cleanPath = ltrim(str_replace('\\', '/', trim($path)), '/');
+        if (str_starts_with($cleanPath, 'storage/')) {
+            $cleanPath = substr($cleanPath, strlen('storage/'));
+        }
+
+        return str_starts_with($cleanPath, ['image-library/', 'ai-seed-library/', 'react-admin-media/']);
+    }
+}
+
 if (!function_exists('getPath')) {
     function getPath($value, $folder = null)
     {
@@ -1517,6 +1544,10 @@ if (!function_exists('getPath')) {
 
         $base = trim(config('app.url'), '/');
         $path = trim($value, '/');
+
+        if (is_string($value) && isMediaLibraryPath($value)) {
+            return publicMediaLibraryUrl($value);
+        }
 
         if (isPath($value)) {
             return $base . "/" . $path;

@@ -7091,6 +7091,50 @@ class AdminReactController extends Controller
         ]);
     }
 
+    public function publicMediaLibraryFile(Request $request)
+    {
+        $path = $this->normalizeMediaLibraryDiskPath((string) $request->query('path', ''));
+        if ($path === '') {
+            return response()->json(['message' => 'Missing file path.'], 422);
+        }
+
+        if (Str::startsWith($path, 'storage/')) {
+            $path = Str::after($path, 'storage/');
+        }
+
+        if (
+            str_contains($path, '..') ||
+            !Str::startsWith($path, ['image-library/', 'ai-seed-library/', 'react-admin-media/'])
+        ) {
+            return response()->json(['message' => 'Invalid media path.'], 422);
+        }
+
+        $disk = Storage::disk('public');
+        if (!$disk->exists($path)) {
+            return response()->json(['message' => 'File not found.'], 404);
+        }
+
+        $mime = $disk->mimeType($path) ?: 'application/octet-stream';
+        if (!Str::startsWith($mime, 'image/')) {
+            return response()->json(['message' => 'Unsupported media type.'], 415);
+        }
+
+        $stream = $disk->readStream($path);
+        if (!$stream) {
+            return response()->json(['message' => 'Unable to read file.'], 500);
+        }
+
+        return Response::stream(function () use ($stream) {
+            fpassthru($stream);
+            if (is_resource($stream)) {
+                fclose($stream);
+            }
+        }, 200, [
+            'Content-Type' => $mime,
+            'Cache-Control' => 'public, max-age=31536000, immutable',
+        ]);
+    }
+
     public function catalogVariantUpdate(Request $request, string $type, int $id): JsonResponse
     {
         $ctx = $this->resolveReactStoreContext($request);
