@@ -12380,10 +12380,12 @@ class AdminReactController extends Controller
         $phone = trim((string) $phone);
         $email = trim((string) $email);
         $errors = [];
+        $sent = [];
 
         if ($phone !== '') {
             try {
                 $this->sendOtp($phone, $otp, 'Registration', $name);
+                $sent[] = 'whatsapp';
             } catch (\Throwable $exception) {
                 $errors['phone'] = 'Unable to send OTP on WhatsApp. Please try again shortly.';
                 Log::warning('React admin registration OTP WhatsApp failed.', [
@@ -12396,6 +12398,7 @@ class AdminReactController extends Controller
         if ($email !== '' && filter_var($email, FILTER_VALIDATE_EMAIL)) {
             try {
                 $this->sendOtp($email, $otp, 'Registration', $name);
+                $sent[] = 'email';
             } catch (\Throwable $exception) {
                 $errors['email'] = 'Unable to send OTP by email. Please check mail settings and try again.';
                 Log::warning('React admin registration OTP email failed.', [
@@ -12410,8 +12413,18 @@ class AdminReactController extends Controller
         }
 
         if (!empty($errors)) {
-            $errors['message'] = $errors['message'] ?? implode(' ', array_values($errors));
-            throw ValidationException::withMessages($errors);
+            $message = implode(' ', array_values($errors));
+
+            if (!empty($sent)) {
+                Log::warning('React admin registration OTP partially sent.', [
+                    'sent_channels' => $sent,
+                    'failed_channels' => array_keys($errors),
+                ]);
+            }
+
+            throw ValidationException::withMessages([
+                'message' => $message,
+            ]);
         }
     }
 

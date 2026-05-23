@@ -43,11 +43,7 @@ class Handler extends ExceptionHandler
     // app/Exceptions/Handler.php
     protected function unauthenticated($request, \Illuminate\Auth\AuthenticationException $exception)
     {
-        if ($request->expectsJson()) {
-            return sendError("Unauthorized access.", [], 401);
-        }
-
-        return redirect()->guest(route('login'));
+        return sendError("Unauthorized access.", [], 401);
     }
 
 

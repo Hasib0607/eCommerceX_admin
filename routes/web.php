@@ -21,7 +21,7 @@ Route::middleware(['auth'])->group(function () {
 
 Route::prefix('react-admin-api')->group(function () {
     Route::get('/csrf-token', [AdminReactController::class, 'csrfToken']);
-    Route::post('/login', [AdminReactController::class, 'login']);
+    Route::post('/login', [AdminReactController::class, 'login'])->name('login');
     Route::post('/register/request-otp', [AdminReactController::class, 'registerRequestOtp'])->middleware('guest');
     Route::post('/register/verify-otp', [AdminReactController::class, 'registerVerifyOtp'])->middleware('guest');
     Route::post('/register/resend-otp', [AdminReactController::class, 'registerResendOtp'])->middleware('guest');
