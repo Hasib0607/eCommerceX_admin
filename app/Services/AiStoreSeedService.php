@@ -53,7 +53,7 @@ class AiStoreSeedService
 
         try {
             $this->assignStorefrontDesign($blueprint, $store, $customer, $user, $businessCategory, $aiPreferences);
-            $categoryMap = $this->createCategories($blueprint, $store, $customer, $user);
+            $categoryMap = $this->createCategories($blueprint, $store, $customer, $user, $businessCategory);
             $this->createProducts($blueprint, $batch, $store, $customer, $user, $businessCategory, $categoryMap);
             $this->createSliderBanners($blueprint, $store, $customer, $user, $businessCategory);
             $this->repairMissingStoreSeedImages($batch, $store, $businessCategory);
@@ -401,6 +401,7 @@ class AiStoreSeedService
             'currency' => (int) ($store->currency ?? 1),
             'launch_mode' => $launchMode ?: 'auto',
             'ai_preferences' => $aiPreferences,
+            'seed_image_candidates' => $this->seedImageCandidatesForBot($businessCategory),
         ];
 
         try {
@@ -1021,7 +1022,7 @@ class AiStoreSeedService
         ];
     }
 
-    private function createCategories(array $blueprint, Store $store, Customer $customer, User $user): array
+    private function createCategories(array $blueprint, Store $store, Customer $customer, User $user, ?BusinessCategory $businessCategory): array
     {
         $map = [];
         $catalog = $blueprint['catalog_blueprint'] ?? [];
@@ -1030,6 +1031,7 @@ class AiStoreSeedService
             $row = $this->firstOrNewCategory((string) ($item['name'] ?? $slug), null, $store, $customer);
             $this->fillCategoryMeta($row, $store, $customer, $user, $index);
             $this->setIfColumn($row, 'parent', '0');
+            $this->assignCategorySeedImages($row, $store, $businessCategory, $slug, '', $index + 1, $item['image_seed_id'] ?? null);
             $row->save();
             $map[$slug] = ['id' => $row->id, 'subcategories' => []];
         }
@@ -1044,6 +1046,7 @@ class AiStoreSeedService
             $row = $this->firstOrNewCategory((string) ($item['name'] ?? $slug), (string) $parentId, $store, $customer);
             $this->fillCategoryMeta($row, $store, $customer, $user, $index);
             $row->parent = (string) $parentId;
+            $this->assignCategorySeedImages($row, $store, $businessCategory, $parentSlug, $slug, $index + 1, $item['image_seed_id'] ?? null);
             $row->save();
             $map[$parentSlug]['subcategories'][$slug] = $row->id;
         }
@@ -1063,7 +1066,8 @@ class AiStoreSeedService
                 continue;
             }
 
-            $sourceImage = $this->pickImage('product', $businessCategory, (array) ($item['image_tags'] ?? []), $categorySlug, $subcategorySlug);
+            $sourceImage = $this->seedImageById($item['image_seed_id'] ?? null)
+                ?: $this->pickImage('product', $businessCategory, (array) ($item['image_tags'] ?? []), $categorySlug, $subcategorySlug);
             $generatedImage = $sourceImage
                 ? $this->copySeedImage($sourceImage, $store, 'products', (int) ($profile['width'] ?? 900), (int) ($profile['height'] ?? 900), 'product_' . ($index + 1))
                 : null;
@@ -1120,7 +1124,8 @@ class AiStoreSeedService
 
         foreach ($sliderBanners as $index => $item) {
             $usageType = (string) ($item['usage_type'] ?? 'banner');
-            $sourceImage = $this->pickImage($usageType, $businessCategory, (array) ($item['image_tags'] ?? []), '', '');
+            $sourceImage = $this->seedImageById($item['image_seed_id'] ?? null)
+                ?: $this->pickImage($usageType, $businessCategory, (array) ($item['image_tags'] ?? []), '', '');
             $generatedImage = $sourceImage
                 ? $this->copySeedImage($sourceImage, $store, $usageType === 'slider' ? 'sliders' : 'banners', $usageType === 'slider' ? 1600 : 1200, $usageType === 'slider' ? 600 : 500, $usageType . '_' . ($index + 1))
                 : null;
@@ -1190,6 +1195,52 @@ class AiStoreSeedService
         return null;
     }
 
+    private function seedImageById($id): ?AiSeedImageLibrary
+    {
+        if (!Schema::hasTable('ai_seed_image_libraries') || !is_numeric($id) || (int) $id <= 0) {
+            return null;
+        }
+
+        return AiSeedImageLibrary::query()
+            ->where('id', (int) $id)
+            ->where('status', true)
+            ->first();
+    }
+
+    private function seedImageCandidatesForBot(?BusinessCategory $businessCategory): array
+    {
+        if (!Schema::hasTable('ai_seed_image_libraries')) {
+            return [];
+        }
+
+        $categoryId = $businessCategory?->id ? (int) $businessCategory->id : null;
+        $query = AiSeedImageLibrary::query()->where('status', true)->latest('id');
+        if ($categoryId) {
+            $query->where(function ($q) use ($businessCategory, $categoryId) {
+                $q->where('business_category_id', $categoryId)
+                    ->orWhereNull('business_category_id');
+                if (Schema::hasColumn('ai_seed_image_libraries', 'business_category_ids')) {
+                    $q->orWhereJsonContains('business_category_ids', $categoryId)
+                        ->orWhereJsonContains('business_category_ids', (string) $categoryId);
+                }
+                if (trim((string) $businessCategory->name) !== '') {
+                    $q->orWhere('business_category_name', $businessCategory->name);
+                }
+            });
+        }
+
+        return $query->limit(200)->get()->map(static fn (AiSeedImageLibrary $row) => [
+            'id' => (int) $row->id,
+            'usage_type' => (string) ($row->usage_type ?? ''),
+            'business_category_name' => (string) ($row->business_category_name ?? ''),
+            'category_slug' => (string) ($row->category_slug ?? ''),
+            'subcategory_slug' => (string) ($row->subcategory_slug ?? ''),
+            'tags' => (string) ($row->tags ?? ''),
+            'alt_text' => (string) ($row->alt_text ?? ''),
+            'original_name' => (string) ($row->original_name ?? ''),
+        ])->values()->all();
+    }
+
     private function seedImageUsageFallbacks(string $usageType): array
     {
         $usageType = trim($usageType) ?: 'product';
@@ -1234,13 +1285,15 @@ class AiStoreSeedService
             return null;
         }
 
+        $legacy = $this->copySeedImageToLegacyAssetDirectory($source, $sourcePath ?: (string) $image->path, $folder, $width, $height, $name);
+
         $targetDir = $this->storeSeedMediaLibraryDirectory($store, $folder);
         $targetPath = "{$targetDir}/{$name}_" . Str::lower(Str::random(6)) . '.jpg';
         $disk->makeDirectory($targetDir);
         $target = $disk->path($targetPath);
 
         if ($this->resizeCover($source, $target, $width, $height)) {
-            return 'storage/' . $targetPath;
+            return $legacy ?: 'storage/' . $targetPath;
         }
 
         $fallbackExtension = strtolower((string) pathinfo($sourcePath ?: (string) $image->path, PATHINFO_EXTENSION));
@@ -1251,7 +1304,69 @@ class AiStoreSeedService
         } else {
             $disk->put($fallbackPath, (string) @file_get_contents($source));
         }
-        return 'storage/' . $fallbackPath;
+        return $legacy ?: 'storage/' . $fallbackPath;
+    }
+
+    private function copySeedImageToLegacyAssetDirectory(string $source, string $sourcePath, string $folder, int $width, int $height, string $name): ?string
+    {
+        $directory = $this->legacySeedAssetDirectory($folder, $name);
+        if ($directory === null) {
+            return null;
+        }
+
+        $targetDir = public_path($directory);
+        if (!is_dir($targetDir) && !@mkdir($targetDir, 0755, true) && !is_dir($targetDir)) {
+            return null;
+        }
+
+        $baseName = Str::slug($name) ?: 'ai-seed';
+        $targetName = $baseName . '_' . Str::lower(Str::random(6)) . '.jpg';
+        $target = rtrim($targetDir, DIRECTORY_SEPARATOR) . DIRECTORY_SEPARATOR . $targetName;
+
+        if ($this->resizeCover($source, $target, $width, $height)) {
+            return $targetName;
+        }
+
+        $extension = strtolower((string) pathinfo($sourcePath, PATHINFO_EXTENSION));
+        $extension = preg_replace('/[^a-z0-9]/', '', $extension) ?: 'jpg';
+        $targetName = $baseName . '_' . Str::lower(Str::random(6)) . '.' . $extension;
+        $target = rtrim($targetDir, DIRECTORY_SEPARATOR) . DIRECTORY_SEPARATOR . $targetName;
+
+        return @copy($source, $target) ? $targetName : null;
+    }
+
+    private function legacySeedAssetDirectory(string $folder, string $name): ?string
+    {
+        return match ($folder) {
+            'products' => 'assets/images/product',
+            'sliders' => 'assets/images/slider',
+            'banners' => 'assets/images/banner',
+            'categories' => Str::startsWith($name, 'category_icon_') ? 'assets/images/icon' : 'assets/images/category',
+            default => null,
+        };
+    }
+
+    private function assignCategorySeedImages(Category $row, Store $store, ?BusinessCategory $businessCategory, string $categorySlug, string $subcategorySlug, int $index, $seedImageId = null): void
+    {
+        $sourceImage = $this->seedImageById($seedImageId)
+            ?: $this->pickImage('category', $businessCategory, [], $categorySlug, $subcategorySlug);
+        if (!$sourceImage) {
+            return;
+        }
+
+        if (Schema::hasColumn($row->getTable(), 'banner') && empty((string) ($row->banner ?? ''))) {
+            $bannerImage = $this->copySeedImage($sourceImage, $store, 'categories', 1200, 500, 'category_banner_' . $index);
+            if ($bannerImage) {
+                $row->banner = $bannerImage;
+            }
+        }
+
+        if (Schema::hasColumn($row->getTable(), 'icon') && empty((string) ($row->icon ?? ''))) {
+            $iconImage = $this->copySeedImage($sourceImage, $store, 'categories', 512, 512, 'category_icon_' . $index);
+            if ($iconImage) {
+                $row->icon = $iconImage;
+            }
+        }
     }
 
     private function storeSeedMediaLibraryDirectory(Store $store, string $folder): string
@@ -1330,6 +1445,18 @@ class AiStoreSeedService
                         $this->setIfColumn($banner, 'image', $generatedImage);
                         $banner->save();
                     }
+                });
+        }
+
+        if (Schema::hasTable('categories')) {
+            Category::query()
+                ->where('store_id', (string) $store->id)
+                ->orderBy('id')
+                ->get()
+                ->each(function (Category $category, int $index) use ($store, $businessCategory) {
+                    $categorySlug = Str::slug((string) ($category->name ?? 'category')) ?: 'category';
+                    $this->assignCategorySeedImages($category, $store, $businessCategory, $categorySlug, '', $index + 1);
+                    $category->save();
                 });
         }
     }

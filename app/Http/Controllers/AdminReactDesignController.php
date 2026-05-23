@@ -312,11 +312,11 @@ class AdminReactDesignController extends Controller
         $normalized = ltrim(str_replace('\\', '/', $path), '/');
 
         if (Str::startsWith($normalized, 'storage/image-library/') || Str::startsWith($normalized, 'storage/ai-seed-library/')) {
-            return url('/react-admin-api/media-library/file?path=' . rawurlencode(Str::after($normalized, 'storage/')));
+            return publicMediaLibraryUrl(Str::after($normalized, 'storage/'));
         }
 
         if (Str::startsWith($normalized, ['image-library/', 'ai-seed-library/'])) {
-            return url('/react-admin-api/media-library/file?path=' . rawurlencode($normalized));
+            return publicMediaLibraryUrl($normalized);
         }
 
         if (Str::startsWith($normalized, ['storage/', 'assets/'])) {
@@ -1162,7 +1162,7 @@ class AdminReactDesignController extends Controller
         if (str_starts_with($path, 'storage/')) {
             return $path;
         }
-        if (str_starts_with($path, ['image-library/', 'ai-seed-library/'])) {
+        if (Str::startsWith($path, ['image-library/', 'ai-seed-library/'])) {
             return 'storage/' . $path;
         }
 

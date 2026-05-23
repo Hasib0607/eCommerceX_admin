@@ -7109,17 +7109,17 @@ class AdminReactController extends Controller
             return response()->json(['message' => 'Invalid media path.'], 422);
         }
 
-        $disk = Storage::disk('public');
-        if (!$disk->exists($path)) {
+        $source = $this->publicMediaLibrarySource($path);
+        if (!$source) {
             return response()->json(['message' => 'File not found.'], 404);
         }
 
-        $mime = $disk->mimeType($path) ?: 'application/octet-stream';
+        $mime = $source['mime'] ?: 'application/octet-stream';
         if (!Str::startsWith($mime, 'image/')) {
             return response()->json(['message' => 'Unsupported media type.'], 415);
         }
 
-        $stream = $disk->readStream($path);
+        $stream = $source['stream'];
         if (!$stream) {
             return response()->json(['message' => 'Unable to read file.'], 500);
         }
@@ -7133,6 +7133,30 @@ class AdminReactController extends Controller
             'Content-Type' => $mime,
             'Cache-Control' => 'public, max-age=31536000, immutable',
         ]);
+    }
+
+    private function publicMediaLibrarySource(string $path): ?array
+    {
+        $disk = Storage::disk('public');
+        if ($disk->exists($path)) {
+            return [
+                'mime' => $disk->mimeType($path) ?: null,
+                'stream' => $disk->readStream($path),
+            ];
+        }
+
+        foreach ([public_path('storage/' . $path), public_path($path), storage_path('app/public/' . $path)] as $candidate) {
+            if (!is_file($candidate)) {
+                continue;
+            }
+
+            return [
+                'mime' => mime_content_type($candidate) ?: null,
+                'stream' => fopen($candidate, 'rb'),
+            ];
+        }
+
+        return null;
     }
 
     public function catalogVariantUpdate(Request $request, string $type, int $id): JsonResponse
@@ -7400,7 +7424,7 @@ class AdminReactController extends Controller
             $params['scope'] = 'superadmin';
         }
 
-        return rtrim($this->assetOrigin(), '/') . '/react-admin-api/media-library/file?' . http_build_query($params);
+        return rtrim($this->assetOrigin(), '/') . '/react-admin-api/public/media-library/file?' . http_build_query($params);
     }
 
     private function mediaStoreIdFromPath(string $path): ?string
@@ -7987,7 +8011,7 @@ class AdminReactController extends Controller
     {
         $path = trim((string) $row->path);
         $normalized = $path !== '' ? ltrim(str_replace('\\', '/', $path), '/') : '';
-        $publicUrl = $normalized !== '' ? '/storage/' . $normalized : null;
+        $publicUrl = $normalized !== '' ? publicMediaLibraryUrl($normalized) : null;
 
         return [
             'id' => (int) $row->id,
@@ -11460,12 +11484,16 @@ class AdminReactController extends Controller
         $path = ltrim(str_replace('\\', '/', $value), '/');
         $origin = $this->assetOrigin();
 
+        if (Str::startsWith($path, 'storage/image-library/') || Str::startsWith($path, 'storage/ai-seed-library/')) {
+            return publicMediaLibraryUrl(Str::after($path, 'storage/'));
+        }
+
         if (Str::startsWith($path, ['storage/', 'assets/'])) {
             return $origin . '/' . $path;
         }
 
-        if (Str::startsWith($path, 'image-library/')) {
-            return $origin . '/storage/' . $path;
+        if (Str::startsWith($path, ['image-library/', 'ai-seed-library/'])) {
+            return publicMediaLibraryUrl($path);
         }
 
         $storagePath = 'setting/' . $path;
@@ -11482,7 +11510,7 @@ class AdminReactController extends Controller
         if ($libraryFolder !== '') {
             $libraryPath = 'image-library/superadmin/' . $libraryFolder . '/' . basename($path);
             if (Storage::disk('public')->exists($libraryPath)) {
-                return $origin . '/storage/' . $libraryPath;
+                return publicMediaLibraryUrl($libraryPath);
             }
         }
 

@@ -662,7 +662,7 @@ class SubdomainController extends Controller
         $tokens = $this->productImageTokens($product);
 
         if (empty($tokens) && $variants !== null) {
-            return $this->variantImageTokens($variants);
+            $tokens = $this->variantImageTokens($variants);
         }
 
         return array_values(array_map(fn ($img) => getPath($img, 'assets/images/product'), $tokens));

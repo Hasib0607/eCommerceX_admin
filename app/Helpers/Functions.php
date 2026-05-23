@@ -1491,7 +1491,7 @@ if (!function_exists('getLibraryImagePath')) {
         if (str_starts_with($imagePath, 'storage/')) {
             return $imagePath;
         }
-        if (str_starts_with($imagePath, ['image-library/', 'ai-seed-library/'])) {
+        if (\Illuminate\Support\Str::startsWith($imagePath, ['image-library/', 'ai-seed-library/'])) {
             return 'storage/' . $imagePath;
         }
 
