@@ -4,6 +4,12 @@ return [
     'frontend_url' => env('WHATSAPP_AUTOMATION_FRONTEND_URL', 'http://localhost:5173'),
     'bot_api_url' => env('WHATSAPP_BOT_API_URL', ''),
     'bot_admin_token' => env('WHATSAPP_BOT_ADMIN_TOKEN', ''),
+    'gateway_api_url' => env('WHATSAPP_GATEWAY_API_URL', env('WHATSAPP_BOT_API_URL', '')),
+    'gateway_api_secret' => env('WHATSAPP_GATEWAY_API_SECRET', env('WHATSAPP_BOT_ADMIN_TOKEN', '')),
+    'otp_bot_type' => env('WHATSAPP_OTP_BOT_TYPE', 'support'),
+    'otp_source_type' => env('WHATSAPP_OTP_SOURCE_TYPE', 'otp'),
+    'otp_gateway_tenant_id' => env('WHATSAPP_OTP_GATEWAY_TENANT_ID', env('WHATSAPP_GATEWAY_TENANT_ID', '')),
+    'store_create_source_type' => env('WHATSAPP_STORE_CREATE_SOURCE_TYPE', 'store_create'),
     /** Appended to bot_api_url for landing GET proxy (live client links). */
     'live_clients_path' => env('WHATSAPP_BOT_LIVE_CLIENTS_PATH', 'live-client-showcases'),
     'react_token_secret' => env('WHATSAPP_REACT_TOKEN_SECRET', ''),

@@ -18,5 +18,6 @@ class AiSeedImageLibrary extends Model
         'width' => 'integer',
         'height' => 'integer',
         'business_category_id' => 'integer',
+        'business_category_ids' => 'array',
     ];
 }

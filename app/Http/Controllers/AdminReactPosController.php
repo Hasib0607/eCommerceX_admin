@@ -2,6 +2,7 @@
 
 namespace App\Http\Controllers;
 
+use App\Support\AdminContactValidation;
 use App\Models\Branch;
 use App\Models\Branchproduct;
 use App\Models\AddonsExpired;
@@ -344,8 +345,8 @@ class AdminReactPosController extends Controller
 
         $payload = $request->validate([
             'name' => ['required', 'string', 'max:255'],
-            'email' => ['nullable', 'string', 'max:255'],
-            'phone' => ['nullable', 'string', 'max:100'],
+            'email' => AdminContactValidation::emailRules(false, 255),
+            'phone' => AdminContactValidation::phoneRules(false, 100),
             'address' => ['nullable', 'string', 'max:255'],
             'tax' => ['nullable', 'numeric'],
         ]);
@@ -535,9 +536,9 @@ class AdminReactPosController extends Controller
     public function saveCustomer(Request $request): JsonResponse
     {
         $payload = $request->validate([
-            'phone' => ['required', 'string', 'max:50'],
+            'phone' => AdminContactValidation::phoneRules(true, 50),
             'name' => ['nullable', 'string', 'max:255'],
-            'email' => ['nullable', 'string', 'max:255'],
+            'email' => AdminContactValidation::emailRules(false, 255),
             'address' => ['nullable', 'string', 'max:255'],
         ]);
         $user = User::where('phone', $payload['phone'])->first();

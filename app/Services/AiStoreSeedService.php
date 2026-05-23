@@ -9,10 +9,15 @@ use App\Models\Banner;
 use App\Models\BusinessCategory;
 use App\Models\Category;
 use App\Models\Customer;
+use App\Models\Design;
+use App\Models\Designlist;
 use App\Models\Product;
 use App\Models\Slider;
 use App\Models\Store;
+use App\Models\Template;
+use App\Models\Temposition;
 use App\Models\User;
+use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Schema;
 use Illuminate\Support\Facades\Storage;
@@ -47,9 +52,11 @@ class AiStoreSeedService
         ]);
 
         try {
+            $this->assignStorefrontDesign($blueprint, $store, $customer, $user, $businessCategory, $aiPreferences);
             $categoryMap = $this->createCategories($blueprint, $store, $customer, $user);
             $this->createProducts($blueprint, $batch, $store, $customer, $user, $businessCategory, $categoryMap);
             $this->createSliderBanners($blueprint, $store, $customer, $user, $businessCategory);
+            $this->repairMissingStoreSeedImages($batch, $store, $businessCategory);
             $batch->status = 'done';
             $batch->save();
         } catch (Throwable $e) {
@@ -81,16 +88,25 @@ class AiStoreSeedService
     {
         $fields = collect((array) ($payload['fields'] ?? []))
             ->map(function ($field, $index) {
-                return [
+                $rawValue = (string) ($field['value'] ?? '');
+                $constraints = $this->extractFieldWordConstraints(array_merge((array) $field, ['value' => $rawValue]));
+                $normalized = [
                     'key' => (string) ($field['key'] ?? "field_{$index}"),
                     'label' => (string) ($field['label'] ?? $field['key'] ?? "Field {$index}"),
-                    'value' => (string) ($field['value'] ?? ''),
+                    'value' => $this->stripFieldWordCommands($rawValue),
                     'type' => (string) ($field['type'] ?? 'text'),
                     'placeholder' => (string) ($field['placeholder'] ?? ''),
                     'name' => (string) ($field['name'] ?? ''),
                     'section' => (string) ($field['section'] ?? ''),
                     'nearby_text' => (string) ($field['nearby_text'] ?? ''),
                 ];
+                if ($constraints['min']) {
+                    $normalized['word_min'] = $constraints['min'];
+                }
+                if ($constraints['max']) {
+                    $normalized['word_limit'] = $constraints['max'];
+                }
+                return $normalized;
             })
             ->filter(fn ($field) => trim($field['label'] . $field['value']) !== '')
             ->take(30)
@@ -153,16 +169,20 @@ class AiStoreSeedService
             'Do not generate unrelated generic text; match the page purpose and the field section.',
             'Never include field labels, instruction text, examples like e.g., explanations, prefixes, or quotation marks in generated values.',
             'For a label such as "Briefly describe the plan (e.g., Ideal for beginners)", return only a final value like "Ideal for beginners".',
-            'If a field payload includes word_limit, stay at or below that many words.',
+            'If a field payload includes word_min, return at least that many words. If it includes word_limit, stay at or below that many words.',
+            'If both word_min and word_limit are the same, return exactly that many words.',
             'Return only valid JSON with this exact shape: {"fields":{"field_key":"generated text"}}.',
             'Do not include markdown, explanations, or extra keys.',
         ]);
 
         $payload['fields'] = collect((array) ($payload['fields'] ?? []))
             ->map(function ($field) {
-                $limit = $this->extractFieldWordLimit((array) $field);
-                if ($limit) {
-                    $field['word_limit'] = $limit;
+                $constraints = $this->extractFieldWordConstraints((array) $field);
+                if ($constraints['min']) {
+                    $field['word_min'] = $constraints['min'];
+                }
+                if ($constraints['max']) {
+                    $field['word_limit'] = $constraints['max'];
                 }
                 return $field;
             })
@@ -210,7 +230,7 @@ class AiStoreSeedService
             (string) ($field['nearby_text'] ?? ''),
         ])));
         $example = $this->extractFieldInstructionExample($instruction);
-        $wordLimit = $this->extractFieldWordLimit($field);
+        $wordConstraints = $this->extractFieldWordConstraints($field);
         $lowerText = strtolower($text);
 
         if ($example !== '' && (
@@ -219,14 +239,14 @@ class AiStoreSeedService
             || str_contains($lowerText, 'example')
             || ($label !== '' && str_starts_with($lowerText, strtolower($label)))
         )) {
-            return $this->limitGeneratedFieldWords($example, $wordLimit);
+            return $this->enforceGeneratedFieldWords($example, $wordConstraints, $field);
         }
 
         if ($label !== '' && str_starts_with($lowerText, strtolower($label))) {
             $text = ltrim(substr($text, strlen($label)), " :-—–\t\n\r\0\x0B");
         }
 
-        return $this->limitGeneratedFieldWords(trim($text, " \t\n\r\0\x0B\"'"), $wordLimit);
+        return $this->enforceGeneratedFieldWords(trim($text, " \t\n\r\0\x0B\"'"), $wordConstraints, $field);
     }
 
     private function extractFieldInstructionExample(string $instruction): string
@@ -247,6 +267,13 @@ class AiStoreSeedService
 
     private function extractFieldWordLimit(array $field): ?int
     {
+        return $this->extractFieldWordConstraints($field)['max'];
+    }
+
+    private function extractFieldWordConstraints(array $field): array
+    {
+        $explicitMin = (int) ($field['word_min'] ?? 0);
+        $explicitMax = (int) ($field['word_limit'] ?? $field['word_max'] ?? 0);
         $text = strtolower(implode(' ', array_filter([
             (string) ($field['value'] ?? ''),
             (string) ($field['label'] ?? ''),
@@ -254,17 +281,43 @@ class AiStoreSeedService
             (string) ($field['nearby_text'] ?? ''),
         ])));
 
-        foreach ([
-            '/(?:within|under|max(?:imum)?|limit|up to)\s+(\d{1,3})\s+words?/i',
-            '/(\d{1,3})\s+words?\s*(?:max|maximum|limit|within|under|er moddhe|er majhe|er vitore|moddhe|majhe|vitore)?/i',
-            '/(\d{1,3})\s*(?:টি|ta)?\s*(?:শব্দ|word)\s*(?:এর মধ্যে|এর মাঝে|er moddhe|er majhe|moddhe|majhe)?/iu',
-        ] as $pattern) {
-            if (preg_match($pattern, $text, $matches)) {
-                return max(1, min(80, (int) ($matches[1] ?? 0)));
+        $min = $explicitMin > 0 ? max(1, min(80, $explicitMin)) : null;
+        $max = $explicitMax > 0 ? max(1, min(80, $explicitMax)) : null;
+
+        if (!$min) {
+            foreach ([
+                '/\bmin(?:imum)?\s*[-:]?\s*(\d{1,3})\s*:?\b/i',
+                '/\bmin-(\d{1,3})\s*:/i',
+                '/(?:more than|at least|minimum|min)\s+(\d{1,3})\s+words?/i',
+                '/(\d{1,3})\s+words?\s*(?:min|minimum|at least|or more)/i',
+            ] as $pattern) {
+                if (preg_match($pattern, $text, $matches)) {
+                    $min = max(1, min(80, (int) ($matches[1] ?? 0)));
+                    break;
+                }
             }
         }
 
-        return null;
+        if (!$max) {
+            foreach ([
+                '/\bmax(?:imum)?\s*[-:]?\s*(\d{1,3})\s*:?\b/i',
+                '/\bmax-(\d{1,3})\s*:/i',
+                '/(?:within|under|max(?:imum)?|limit|up to)\s+(\d{1,3})\s+words?/i',
+                '/(\d{1,3})\s+words?\s*(?:max|maximum|limit|within|under|er moddhe|er majhe|er vitore|moddhe|majhe|vitore)/i',
+                '/(\d{1,3})\s*(?:টি|ta)?\s*(?:শব্দ|word)\s*(?:এর মধ্যে|এর মাঝে|er moddhe|er majhe|moddhe|majhe)?/iu',
+            ] as $pattern) {
+                if (preg_match($pattern, $text, $matches)) {
+                    $max = max(1, min(80, (int) ($matches[1] ?? 0)));
+                    break;
+                }
+            }
+        }
+
+        if ($min && $max && $min > $max) {
+            $max = $min;
+        }
+
+        return ['min' => $min, 'max' => $max];
     }
 
     private function limitGeneratedFieldWords(string $value, ?int $limit): string
@@ -279,6 +332,57 @@ class AiStoreSeedService
         }
 
         return rtrim(implode(' ', array_slice($words, 0, $limit)), " ,.;:-");
+    }
+
+    private function enforceGeneratedFieldWords(string $value, array $constraints, array $field): string
+    {
+        $min = $constraints['min'] ?? null;
+        $max = $constraints['max'] ?? null;
+        $text = $this->limitGeneratedFieldWords($value, $max);
+        $words = preg_split('/\s+/u', trim($text), -1, PREG_SPLIT_NO_EMPTY) ?: [];
+
+        if (!$min || count($words) >= $min) {
+            return $text;
+        }
+
+        $expanded = $this->expandGeneratedFieldWords($text, $min, $max, $field);
+        return $this->limitGeneratedFieldWords($expanded, $max);
+    }
+
+    private function expandGeneratedFieldWords(string $value, int $min, ?int $max, array $field): string
+    {
+        $limit = $max;
+        $text = trim($value);
+        $context = trim(implode(' ', array_filter([
+            (string) ($field['section'] ?? ''),
+            (string) ($field['label'] ?? ''),
+            (string) ($field['placeholder'] ?? ''),
+        ])));
+        $addons = [
+            'It keeps setup simple, gives users the essentials they need, and leaves enough flexibility to grow when their business is ready.',
+            'This option works well for practical ecommerce teams that want clear value, reliable features, and an easy path to upgrade later.',
+            'It is designed to feel approachable, useful, and focused on helping customers start confidently without unnecessary complexity.',
+        ];
+
+        foreach ($addons as $addon) {
+            $candidate = trim($text . ' ' . $addon);
+            if ($context !== '' && count(preg_split('/\s+/u', $candidate, -1, PREG_SPLIT_NO_EMPTY) ?: []) < $min) {
+                $candidate .= ' The copy should fit the ' . $context . ' context naturally.';
+            }
+            $text = $this->limitGeneratedFieldWords($candidate, $limit);
+            if (count(preg_split('/\s+/u', $text, -1, PREG_SPLIT_NO_EMPTY) ?: []) >= $min) {
+                return $text;
+            }
+        }
+
+        return $text;
+    }
+
+    private function stripFieldWordCommands(string $value): string
+    {
+        $text = preg_replace('/\b(?:min|max)-\s*\d{1,3}\s*:\s*/i', '', $value) ?? $value;
+        $text = preg_replace('/\b(?:more than|at least|minimum|max(?:imum)?|up to|within|under|limit)\s+\d{1,3}\s+words?\s*:\s*/i', '', $text) ?? $text;
+        return trim($text);
     }
 
     private function blueprint(Store $store, ?BusinessCategory $businessCategory, string $launchMode, ?array $aiPreferences): array
@@ -491,6 +595,432 @@ class AiStoreSeedService
         ];
     }
 
+    private function assignStorefrontDesign(array $blueprint, Store $store, Customer $customer, User $user, ?BusinessCategory $businessCategory, ?array $aiPreferences): void
+    {
+        if (!Schema::hasTable('designs')) {
+            return;
+        }
+
+        $template = $this->chooseStoreTemplate($blueprint, $businessCategory, $aiPreferences);
+        $sectionValues = $template ? $this->templateSectionValues($template) : [];
+        $sectionValues = $this->fillMissingSectionValuesFromDesignlists($sectionValues, $blueprint, $businessCategory, $aiPreferences, $template);
+
+        if (!$template && empty(array_filter($sectionValues))) {
+            return;
+        }
+
+        $design = Design::query()->where('store_id', $store->id)->first() ?: new Design();
+        $this->setIfColumn($design, 'store_id', (string) $store->id);
+        $this->setIfColumn($design, 'uid', (string) $user->id);
+        $this->setIfColumn($design, 'customer_id', (string) $customer->id);
+        $this->setIfColumn($design, 'creator', (string) $user->id);
+        $this->setIfColumn($design, 'editor', (string) $user->id);
+        $this->setIfColumn($design, 'header_color', '#ffffff');
+        $this->setIfColumn($design, 'text_color', '#000000');
+        if ($template) {
+            $this->setIfColumn($design, 'template_id', (string) $template->id);
+        }
+
+        foreach ($this->designSectionColumnMap() as $section => $column) {
+            if (array_key_exists($section, $sectionValues)) {
+                $this->setIfColumn($design, $column, $sectionValues[$section]);
+            }
+        }
+
+        $design->save();
+
+        if ($template) {
+            $this->setIfColumn($store, 'template_id', (string) $template->id);
+            $store->save();
+            $this->setIfColumn($customer, 'template_id', (string) $template->id);
+            $customer->save();
+        }
+
+        $this->syncTemplatePositionsToStore((int) $store->id, $template);
+    }
+
+    private function chooseStoreTemplate(array $blueprint, ?BusinessCategory $businessCategory, ?array $aiPreferences): ?Template
+    {
+        if (!Schema::hasTable('templates')) {
+            return null;
+        }
+
+        $requested = $blueprint['design_blueprint']['template_id']
+            ?? $blueprint['design']['template_id']
+            ?? $aiPreferences['template_id']
+            ?? null;
+        if ($requested && ($template = Template::query()->find((int) $requested)) && $this->isActiveStatus($template->status ?? 'active')) {
+            return $template;
+        }
+
+        $requestedValue = trim((string) (
+            $blueprint['design_blueprint']['template_value']
+            ?? $blueprint['design']['template_value']
+            ?? $aiPreferences['template_value']
+            ?? ''
+        ));
+        if ($requestedValue !== '') {
+            $template = Template::query()
+                ->where(function ($query) use ($requestedValue) {
+                    $query->where('value', $requestedValue)->orWhere('name', $requestedValue);
+                })
+                ->get()
+                ->first(fn ($row) => $this->isActiveStatus($row->status ?? 'active'));
+            if ($template) {
+                return $template;
+            }
+        }
+
+        $templates = Template::query()
+            ->orderBy('position', 'asc')
+            ->orderByDesc('id')
+            ->get()
+            ->filter(fn (Template $template) => $this->isActiveStatus($template->status ?? 'active'))
+            ->values();
+
+        if ($templates->isEmpty()) {
+            return null;
+        }
+
+        $ranked = $templates
+            ->map(fn (Template $template) => [
+                'template' => $template,
+                'score' => $this->templateMatchScore($template, $blueprint, $businessCategory, $aiPreferences),
+            ])
+            ->sortByDesc('score')
+            ->values();
+
+        return $ranked->first()['template'] ?? $templates->first();
+    }
+
+    private function templateMatchScore(Template $template, array $blueprint, ?BusinessCategory $businessCategory, ?array $aiPreferences): int
+    {
+        $score = 0;
+        $categoryId = $businessCategory?->id ? (int) $businessCategory->id : null;
+        if ($categoryId && $this->modelCategoryMatches($template, $categoryId)) {
+            $score += 100;
+        }
+
+        $position = (int) ($template->position ?? 0);
+        if ($position > 0) {
+            $score += max(0, 30 - min(30, $position));
+        }
+
+        $haystack = strtolower(trim(implode(' ', array_filter([
+            (string) ($template->name ?? ''),
+            (string) ($template->value ?? ''),
+            (string) ($template->short_description ?? ''),
+            (string) ($template->reviewer ?? ''),
+        ]))));
+
+        foreach ($this->designIntentKeywords($blueprint, $businessCategory, $aiPreferences) as $keyword) {
+            if ($keyword !== '' && str_contains($haystack, $keyword)) {
+                $score += 12;
+            }
+        }
+
+        return $score;
+    }
+
+    private function fillMissingSectionValuesFromDesignlists(array $sectionValues, array $blueprint, ?BusinessCategory $businessCategory, ?array $aiPreferences, ?Template $template = null): array
+    {
+        if (!Schema::hasTable('designlists')) {
+            return $sectionValues;
+        }
+
+        foreach ($this->designSectionTypeMap() as $section => $type) {
+            if ($this->sectionValueIsUsable($sectionValues[$section] ?? '')) {
+                continue;
+            }
+            $row = $this->chooseDesignlistForType($type, $blueprint, $businessCategory, $aiPreferences, $template);
+            if ($row && trim((string) ($row->value ?? '')) !== '') {
+                $sectionValues[$section] = (string) $row->value;
+            }
+        }
+
+        return $sectionValues;
+    }
+
+    private function chooseDesignlistForType(string $type, array $blueprint, ?BusinessCategory $businessCategory, ?array $aiPreferences, ?Template $template = null): ?Designlist
+    {
+        $rows = Designlist::query()
+            ->where('type', $type)
+            ->orderByDesc('id')
+            ->get()
+            ->filter(fn (Designlist $row) => $this->isActiveStatus($row->status ?? 'active'))
+            ->values();
+        if ($rows->isEmpty()) {
+            return null;
+        }
+
+        $ranked = $rows
+            ->map(fn (Designlist $row) => [
+                'row' => $row,
+                'score' => $this->designlistMatchScore($row, $blueprint, $businessCategory, $aiPreferences, $template),
+            ])
+            ->sortByDesc('score')
+            ->values();
+
+        return $ranked->first()['row'] ?? $rows->first();
+    }
+
+    private function designlistMatchScore(Designlist $row, array $blueprint, ?BusinessCategory $businessCategory, ?array $aiPreferences, ?Template $template = null): int
+    {
+        $score = 0;
+        $categoryId = $businessCategory?->id ? (int) $businessCategory->id : null;
+        if ($categoryId && $this->modelCategoryMatches($row, $categoryId)) {
+            $score += 100;
+        }
+
+        if ($template && $this->modelsShareAnyCategory($row, $template)) {
+            $score += 60;
+        }
+
+        $haystack = strtolower(trim(implode(' ', array_filter([
+            (string) ($row->name ?? ''),
+            (string) ($row->value ?? ''),
+            (string) ($row->type ?? ''),
+            (string) ($row->title ?? ''),
+            (string) ($row->subtitle ?? ''),
+            (string) ($row->image_description ?? ''),
+            is_string($row->ai_preferences ?? null) ? (string) $row->ai_preferences : '',
+        ]))));
+
+        foreach ($this->designIntentKeywords($blueprint, $businessCategory, $aiPreferences) as $keyword) {
+            if ($keyword !== '' && str_contains($haystack, $keyword)) {
+                $score += 12;
+            }
+        }
+
+        return $score;
+    }
+
+    private function templateSectionValues(Template $template): array
+    {
+        $values = [];
+        foreach ($this->templateToDesignColumnMap() as $templateColumn => $designSection) {
+            $values[$designSection] = $this->sectionValueIsUsable($template->{$templateColumn} ?? null)
+                ? (string) $template->{$templateColumn}
+                : '';
+        }
+        return $values;
+    }
+
+    private function sectionValueIsUsable($value): bool
+    {
+        $normalized = strtolower(trim((string) $value));
+        return !in_array($normalized, ['', '0', 'null', 'select', 'select design', 'select template', 'none'], true);
+    }
+
+    private function syncTemplatePositionsToStore(int $storeId, ?Template $template): void
+    {
+        if (!$template || !Schema::hasTable('tempositions') || !Schema::hasTable('design_positions')) {
+            return;
+        }
+
+        $positions = Temposition::query()
+            ->where('template_id', $template->id)
+            ->get(['name', 'position']);
+
+        foreach ($positions as $position) {
+            $name = trim((string) ($position->name ?? ''));
+            if ($name === '') {
+                continue;
+            }
+
+            DB::table('design_positions')->updateOrInsert(
+                ['store_id' => $storeId, 'name' => $name],
+                ['position' => (int) ($position->position ?? 0), 'updated_at' => now(), 'created_at' => now()]
+            );
+        }
+    }
+
+    private function designIntentKeywords(array $blueprint, ?BusinessCategory $businessCategory, ?array $aiPreferences): array
+    {
+        $raw = [
+            (string) ($blueprint['style_profile'] ?? ''),
+            (string) data_get($blueprint, 'design_blueprint.style_profile', ''),
+            (string) data_get($blueprint, 'design_blueprint.visual_style', ''),
+            (string) ($aiPreferences['style_preset'] ?? ''),
+            (string) ($aiPreferences['tone_preset'] ?? ''),
+            (string) ($aiPreferences['primary_goal'] ?? ''),
+            (string) ($businessCategory?->name ?? ''),
+            (string) ($businessCategory?->slug ?? ''),
+        ];
+
+        $expanded = [];
+        foreach ($raw as $value) {
+            $normalized = strtolower(str_replace(['_', '-'], ' ', trim($value)));
+            foreach (preg_split('/\s+/u', $normalized, -1, PREG_SPLIT_NO_EMPTY) ?: [] as $word) {
+                if (strlen($word) >= 3) {
+                    $expanded[] = $word;
+                }
+            }
+            if ($normalized !== '') {
+                $expanded[] = $normalized;
+            }
+        }
+
+        return array_values(array_unique($expanded));
+    }
+
+    private function csvContains(string $csv, string $needle): bool
+    {
+        $needle = trim($needle);
+        if ($needle === '') {
+            return false;
+        }
+
+        $parts = array_map('trim', explode(',', $csv));
+        return in_array($needle, $parts, true);
+    }
+
+    private function modelCategoryIds($model): array
+    {
+        $rawValues = [];
+        foreach (['business_category_ids', 'category_ids', 'category', 'theme_category', 'type'] as $column) {
+            if (isset($model->{$column})) {
+                $rawValues[] = $model->{$column};
+            }
+        }
+
+        return collect($rawValues)
+            ->flatMap(function ($value) {
+                if (is_array($value)) {
+                    return $value;
+                }
+                $text = trim((string) $value);
+                if ($text === '') {
+                    return [];
+                }
+                $decoded = json_decode($text, true);
+                if (is_array($decoded)) {
+                    return $decoded;
+                }
+                return preg_split('/[,|]/', $text) ?: [];
+            })
+            ->map(fn ($id) => trim((string) $id))
+            ->filter(fn ($id) => $id !== '' && ctype_digit($id))
+            ->map(fn ($id) => (int) $id)
+            ->unique()
+            ->values()
+            ->all();
+    }
+
+    private function modelCategoryMatches($model, int $categoryId): bool
+    {
+        return in_array($categoryId, $this->modelCategoryIds($model), true);
+    }
+
+    private function modelsShareAnyCategory($first, $second): bool
+    {
+        $left = $this->modelCategoryIds($first);
+        $right = $this->modelCategoryIds($second);
+        if (empty($left) || empty($right)) {
+            return false;
+        }
+
+        return !empty(array_intersect($left, $right));
+    }
+
+    private function isActiveStatus($status): bool
+    {
+        return in_array(strtolower(trim((string) $status)), ['active', 'on', '1', 'true', 'yes', ''], true);
+    }
+
+    private function templateToDesignColumnMap(): array
+    {
+        return [
+            'header' => 'header',
+            'slider' => 'hero_slider',
+            'banner' => 'banner',
+            'banner_bottom' => 'banner_bottom',
+            'feature_category' => 'feature_category',
+            'product' => 'product',
+            'feature_product' => 'feature_product',
+            'best_sell_product' => 'best_sell_product',
+            'new_arrival' => 'new_arrival',
+            'testimonial' => 'testimonial',
+            'youtube' => 'youtube',
+            'footer' => 'footer',
+            'single_product_page' => 'single_product_page',
+            'shop_page' => 'shop_page',
+            'checkout_page' => 'checkout_page',
+            'login_page' => 'login_page',
+            'profile_page' => 'profile_page',
+            'invoice' => 'invoice',
+            'product_card' => 'product_card',
+            'product_modal' => 'product_modal',
+            'preloader' => 'preloader',
+            'mobile_bottom_menu' => 'mobile_bottom_menu',
+            'blog' => 'blog',
+            'contact' => 'contact',
+            'offer' => 'offer',
+            'auth' => 'auth',
+        ];
+    }
+
+    private function designSectionColumnMap(): array
+    {
+        return [
+            'header' => 'header',
+            'hero_slider' => 'hero_slider',
+            'banner' => 'banner',
+            'banner_bottom' => 'banner_bottom',
+            'feature_category' => 'feature_category',
+            'product' => 'product',
+            'feature_product' => 'feature_product',
+            'best_sell_product' => 'best_sell_product',
+            'new_arrival' => 'new_arrival',
+            'testimonial' => 'testimonial',
+            'youtube' => 'youtube',
+            'footer' => 'footer',
+            'single_product_page' => 'single_product_page',
+            'shop_page' => 'shop_page',
+            'checkout_page' => 'checkout_page',
+            'login_page' => 'login_page',
+            'profile_page' => 'profile_page',
+            'invoice' => 'invoice',
+            'product_card' => 'product_card',
+            'product_modal' => 'product_modal',
+            'preloader' => 'preloader',
+            'mobile_bottom_menu' => 'mobile_bottom_menu',
+            'blog' => 'blog',
+            'contact' => 'contact',
+            'offer' => 'offer',
+            'auth' => 'auth',
+        ];
+    }
+
+    private function designSectionTypeMap(): array
+    {
+        return [
+            'header' => 'header',
+            'hero_slider' => 'slider',
+            'banner' => 'banner',
+            'banner_bottom' => 'banner_bottom',
+            'feature_category' => 'feature_category',
+            'product' => 'product',
+            'feature_product' => 'feature_product',
+            'best_sell_product' => 'best_sell_product',
+            'new_arrival' => 'new_arrival',
+            'testimonial' => 'testimonial',
+            'youtube' => 'youtube',
+            'footer' => 'footer',
+            'single_product_page' => 'single_product_page',
+            'shop_page' => 'shop_page',
+            'checkout_page' => 'checkout_page',
+            'login_page' => 'login_page',
+            'product_card' => 'product_card',
+            'preloader' => 'preloader',
+            'mobile_bottom_menu' => 'mobile_bottom_menu',
+            'blog' => 'blog',
+            'contact' => 'contact',
+            'offer' => 'offer',
+            'auth' => 'auth',
+        ];
+    }
+
     private function createCategories(array $blueprint, Store $store, Customer $customer, User $user): array
     {
         $map = [];
@@ -578,7 +1108,17 @@ class AiStoreSeedService
 
     private function createSliderBanners(array $blueprint, Store $store, Customer $customer, User $user, ?BusinessCategory $businessCategory): void
     {
-        foreach (($blueprint['catalog_blueprint']['slider_banners'] ?? []) as $index => $item) {
+        $sliderBanners = (array) ($blueprint['catalog_blueprint']['slider_banners'] ?? []);
+        if (empty($sliderBanners)) {
+            $businessKey = Str::slug((string) ($businessCategory?->name ?? $store->type ?? 'store'));
+            $storeName = (string) ($store->name ?? 'Store');
+            $sliderBanners = [
+                ['usage_type' => 'slider', 'image_tags' => [$businessKey, 'slider', 'hero'], 'headline' => "{$storeName} Collection", 'subheadline' => 'Fresh picks ready for your customers.', 'cta' => 'Shop Now'],
+                ['usage_type' => 'banner', 'image_tags' => [$businessKey, 'banner', 'offer'], 'headline' => 'New arrivals', 'subheadline' => 'Curated products for a strong launch.', 'cta' => 'Explore'],
+            ];
+        }
+
+        foreach ($sliderBanners as $index => $item) {
             $usageType = (string) ($item['usage_type'] ?? 'banner');
             $sourceImage = $this->pickImage($usageType, $businessCategory, (array) ($item['image_tags'] ?? []), '', '');
             $generatedImage = $sourceImage
@@ -614,36 +1154,87 @@ class AiStoreSeedService
             return null;
         }
 
-        $query = AiSeedImageLibrary::query()
+        $usageTypes = $this->seedImageUsageFallbacks($usageType);
+        $categoryId = $businessCategory?->id ? (int) $businessCategory->id : null;
+
+        foreach ($usageTypes as $candidateUsageType) {
+            if ($categoryId) {
+                $query = $this->baseSeedImageQuery($candidateUsageType)
+                    ->where(function ($q) use ($businessCategory, $categoryId) {
+                        $q->where('business_category_id', $categoryId);
+                        if (Schema::hasColumn('ai_seed_image_libraries', 'business_category_ids')) {
+                            $q->orWhereJsonContains('business_category_ids', $categoryId)
+                                ->orWhereJsonContains('business_category_ids', (string) $categoryId);
+                        }
+                        if (trim((string) $businessCategory->name) !== '') {
+                            $q->orWhere('business_category_name', $businessCategory->name);
+                        }
+                    });
+
+                if ($image = $this->firstSeedImageCandidate($query, $tags, $categorySlug, $subcategorySlug)) {
+                    return $image;
+                }
+            }
+
+            $globalQuery = $this->baseSeedImageQuery($candidateUsageType)
+                ->whereNull('business_category_id');
+            if ($image = $this->firstSeedImageCandidate($globalQuery, $tags, $categorySlug, $subcategorySlug)) {
+                return $image;
+            }
+
+            if ($image = $this->firstSeedImageCandidate($this->baseSeedImageQuery($candidateUsageType), $tags, $categorySlug, $subcategorySlug)) {
+                return $image;
+            }
+        }
+
+        return null;
+    }
+
+    private function seedImageUsageFallbacks(string $usageType): array
+    {
+        $usageType = trim($usageType) ?: 'product';
+        $fallbacks = match ($usageType) {
+            'slider' => ['slider', 'banner', 'product', 'category'],
+            'banner' => ['banner', 'slider', 'product', 'category'],
+            'category' => ['category', 'product', 'banner', 'slider'],
+            default => ['product', 'category', 'banner', 'slider'],
+        };
+
+        return array_values(array_unique($fallbacks));
+    }
+
+    private function baseSeedImageQuery(string $usageType)
+    {
+        return AiSeedImageLibrary::query()
             ->where('usage_type', $usageType)
             ->where('status', true);
-        if ($businessCategory) {
-            $query->where(function ($q) use ($businessCategory) {
-                $q->where('business_category_id', $businessCategory->id)->orWhereNull('business_category_id');
-            });
-        }
+    }
+
+    private function firstSeedImageCandidate($query, array $tags, string $categorySlug, string $subcategorySlug): ?AiSeedImageLibrary
+    {
         if ($categorySlug !== '') {
             $query->orderByRaw('CASE WHEN category_slug = ? THEN 0 ELSE 1 END', [$categorySlug]);
         }
         if ($subcategorySlug !== '') {
             $query->orderByRaw('CASE WHEN subcategory_slug = ? THEN 0 ELSE 1 END', [$subcategorySlug]);
         }
-        foreach (array_slice(array_filter($tags), 0, 3) as $tag) {
+        foreach (array_slice(array_filter(array_map('strval', $tags)), 0, 5) as $tag) {
             $query->orderByRaw('CASE WHEN tags LIKE ? THEN 0 ELSE 1 END', ['%' . $tag . '%']);
         }
 
-        return $query->inRandomOrder()->first();
+        return $query->orderByDesc('id')->first();
     }
 
     private function copySeedImage(AiSeedImageLibrary $image, Store $store, string $folder, int $width, int $height, string $name): ?string
     {
         $disk = Storage::disk('public');
-        if (!$disk->exists($image->path)) {
+        $sourcePath = $this->normalizeSeedImageDiskPath((string) $image->path);
+        $source = $this->seedImageSourcePath($sourcePath);
+        if (!$source) {
             return null;
         }
 
-        $source = $disk->path($image->path);
-        $targetDir = "stores/{$store->id}/ai-seed/{$folder}";
+        $targetDir = $this->storeSeedMediaLibraryDirectory($store, $folder);
         $targetPath = "{$targetDir}/{$name}_" . Str::lower(Str::random(6)) . '.jpg';
         $disk->makeDirectory($targetDir);
         $target = $disk->path($targetPath);
@@ -652,9 +1243,136 @@ class AiStoreSeedService
             return 'storage/' . $targetPath;
         }
 
-        $fallbackPath = "{$targetDir}/{$name}_" . Str::lower(Str::random(6)) . '.' . pathinfo($image->path, PATHINFO_EXTENSION);
-        $disk->copy($image->path, $fallbackPath);
+        $fallbackExtension = strtolower((string) pathinfo($sourcePath ?: (string) $image->path, PATHINFO_EXTENSION));
+        $fallbackExtension = preg_replace('/[^a-z0-9]/', '', $fallbackExtension) ?: 'jpg';
+        $fallbackPath = "{$targetDir}/{$name}_" . Str::lower(Str::random(6)) . '.' . $fallbackExtension;
+        if ($sourcePath !== '' && $disk->exists($sourcePath)) {
+            $disk->copy($sourcePath, $fallbackPath);
+        } else {
+            $disk->put($fallbackPath, (string) @file_get_contents($source));
+        }
         return 'storage/' . $fallbackPath;
+    }
+
+    private function storeSeedMediaLibraryDirectory(Store $store, string $folder): string
+    {
+        $storeId = (string) ($store->id ?? '0');
+        $slug = Str::slug((string) ($store->slug ?? $store->name ?? 'store')) ?: 'store';
+
+        return "image-library/admin/{$slug}-{$storeId}/ai-seed/" . trim($folder, '/');
+    }
+
+    private function repairMissingStoreSeedImages(AiSeedBatch $batch, Store $store, ?BusinessCategory $businessCategory): void
+    {
+        $productImage = $this->pickImage('product', $businessCategory, [], '', '');
+        $sliderImage = $this->pickImage('slider', $businessCategory, [], '', '') ?: $productImage;
+        $bannerImage = $this->pickImage('banner', $businessCategory, [], '', '') ?: $productImage;
+
+        if ($productImage && Schema::hasTable('products')) {
+            Product::query()
+                ->where('store_id', (string) $store->id)
+                ->where(function ($query) {
+                    $query->whereNull('images')->orWhere('images', '');
+                })
+                ->orderBy('id')
+                ->get()
+                ->each(function (Product $product, int $index) use ($batch, $store, $productImage) {
+                    $generatedImage = $this->copySeedImage($productImage, $store, 'products', 900, 900, 'product_repair_' . ($index + 1));
+                    if (!$generatedImage) {
+                        return;
+                    }
+
+                    $this->setIfColumn($product, 'images', $generatedImage);
+                    $product->save();
+
+                    if (Schema::hasTable('ai_seed_products')) {
+                        AiSeedProduct::query()->updateOrCreate(
+                            ['store_id' => $store->id, 'product_id' => $product->id],
+                            [
+                                'batch_id' => $batch->id,
+                                'source_image_id' => $productImage->id,
+                                'generated_image_path' => $generatedImage,
+                                'is_demo' => true,
+                            ]
+                        );
+                    }
+                });
+        }
+
+        if ($sliderImage && Schema::hasTable('sliders')) {
+            Slider::query()
+                ->where('store_id', (string) $store->id)
+                ->where(function ($query) {
+                    $query->whereNull('image')->orWhere('image', '');
+                })
+                ->orderBy('id')
+                ->get()
+                ->each(function (Slider $slider, int $index) use ($store, $sliderImage) {
+                    $generatedImage = $this->copySeedImage($sliderImage, $store, 'sliders', 1600, 600, 'slider_repair_' . ($index + 1));
+                    if ($generatedImage) {
+                        $this->setIfColumn($slider, 'image', $generatedImage);
+                        $slider->save();
+                    }
+                });
+        }
+
+        if ($bannerImage && Schema::hasTable('banners')) {
+            Banner::query()
+                ->where('store_id', (string) $store->id)
+                ->where(function ($query) {
+                    $query->whereNull('image')->orWhere('image', '');
+                })
+                ->orderBy('id')
+                ->get()
+                ->each(function (Banner $banner, int $index) use ($store, $bannerImage) {
+                    $generatedImage = $this->copySeedImage($bannerImage, $store, 'banners', 1200, 500, 'banner_repair_' . ($index + 1));
+                    if ($generatedImage) {
+                        $this->setIfColumn($banner, 'image', $generatedImage);
+                        $banner->save();
+                    }
+                });
+        }
+    }
+
+    private function normalizeSeedImageDiskPath(string $path): string
+    {
+        $path = trim(str_replace('\\', '/', $path));
+        if ($path === '') {
+            return '';
+        }
+
+        if (preg_match('#^https?://[^/]+/(.+)$#i', $path, $matches)) {
+            $path = (string) ($matches[1] ?? $path);
+        }
+
+        $path = ltrim($path, '/');
+        foreach (['storage/', 'public/storage/', 'app/public/'] as $prefix) {
+            if (str_starts_with($path, $prefix)) {
+                $path = substr($path, strlen($prefix));
+            }
+        }
+
+        return ltrim(urldecode($path), '/');
+    }
+
+    private function seedImageSourcePath(string $diskPath): ?string
+    {
+        if ($diskPath === '' || str_contains($diskPath, '..')) {
+            return null;
+        }
+
+        $disk = Storage::disk('public');
+        if ($disk->exists($diskPath)) {
+            return $disk->path($diskPath);
+        }
+
+        foreach ([public_path($diskPath), public_path('storage/' . $diskPath), storage_path('app/public/' . $diskPath)] as $candidate) {
+            if (is_file($candidate)) {
+                return $candidate;
+            }
+        }
+
+        return null;
     }
 
     private function resizeCover(string $source, string $target, int $width, int $height): bool
@@ -690,10 +1408,7 @@ class AiStoreSeedService
         $white = imagecolorallocate($dst, 255, 255, 255);
         imagefill($dst, 0, 0, $white);
         imagecopyresampled($dst, $src, (int) (($width - $newW) / 2), (int) (($height - $newH) / 2), 0, 0, $newW, $newH, $srcW, $srcH);
-        $saved = imagejpeg($dst, $target, 86);
-        imagedestroy($src);
-        imagedestroy($dst);
-        return (bool) $saved;
+        return (bool) imagejpeg($dst, $target, 86);
     }
 
     private function variantPayload(array $item): array

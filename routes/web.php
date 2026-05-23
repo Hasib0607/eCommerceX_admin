@@ -11,6 +11,7 @@ use App\Http\Controllers\AdminReactPromotionController;
 use App\Http\Controllers\AnnouncementController;
 use App\Http\Controllers\LandingPublicApiController;
 use App\Http\Controllers\WhatsAppAutomation\AuthController;
+use App\Http\Controllers\WhatsAppAutomation\GatewaySessionController;
 use Illuminate\Support\Facades\Route;
 
 Route::middleware(['auth'])->group(function () {
@@ -41,6 +42,12 @@ Route::prefix('react-admin-api')->group(function () {
     Route::middleware(['auth', 'react.entitlement'])->group(function () {
         Route::get('/me', [AdminReactController::class, 'me']);
         Route::get('/dashboard', [AdminReactController::class, 'dashboardOverview']);
+        Route::post('/whatsapp/gateway/sessions/create', [GatewaySessionController::class, 'create']);
+        Route::get('/whatsapp/gateway/sessions/{tenantId}/status', [GatewaySessionController::class, 'status']);
+        Route::get('/whatsapp/gateway/sessions/{tenantId}/qr', [GatewaySessionController::class, 'qr']);
+        Route::match(['get', 'post', 'delete'], '/whatsapp/gateway/sessions/{tenantId}/logout', [GatewaySessionController::class, 'logout']);
+        Route::get('/admin-staff/dashboard', [AdminReactController::class, 'adminStaffDashboard']);
+        Route::get('/superstaff/dashboard', [AdminReactController::class, 'superstaffDashboard']);
         Route::get('/reports/revenue', [\App\Http\Controllers\ReportController::class, 'revenueReport']);
         Route::get('/get/report-data/{section}', [\App\Http\Controllers\ReportController::class, 'adminReport']);
         Route::get('/entitlements', [AdminReactController::class, 'entitlements']);
@@ -146,6 +153,7 @@ Route::prefix('react-admin-api')->group(function () {
         Route::post('/superadmin/plans-billing/plans/{planType}/{id}', [AdminReactController::class, 'superadminPlanUpdate'])->whereNumber('id');
         Route::delete('/superadmin/plans-billing/plans/{planType}/{id}', [AdminReactController::class, 'superadminPlanDelete'])->whereNumber('id');
         Route::post('/superadmin/plans-billing/plans/{planType}/{id}/toggle-status', [AdminReactController::class, 'superadminPlanToggleStatus'])->whereNumber('id');
+        Route::post('/superadmin/plans-billing/plans/{planType}/{id}/toggle-trial', [AdminReactController::class, 'superadminPlanToggleTrial'])->whereNumber('id');
         Route::post('/superadmin/plans-billing/plans/{planType}/reorder', [AdminReactController::class, 'superadminPlanReorder']);
         Route::get('/superadmin/addons', [AdminReactController::class, 'superadminAddonsList']);
         Route::post('/superadmin/addons', [AdminReactController::class, 'superadminAddonsStore']);

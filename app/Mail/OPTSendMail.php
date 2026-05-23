@@ -34,7 +34,7 @@ class OPTSendMail extends Mailable
     public function envelope()
     {
         return new Envelope(
-            subject: 'Registration OTP',
+            subject: $this->data['subject'] ?? 'eCommerceX OTP Code',
         );
     }
 
@@ -57,8 +57,19 @@ class OPTSendMail extends Mailable
      */
     public function build()
     {
-        return $this->from($this->data['formEmail'])->subject($this->data['subject'])
-            ->view('email.otp_send');
+        $fromEmail = $this->data['formEmail'] ?: config('mail.from.address');
+        $fromName = $this->data['fromName'] ?? config('mail.from.name', 'eCommerceX');
+
+        return $this->from($fromEmail, $fromName)
+            ->replyTo($fromEmail, $fromName)
+            ->subject($this->data['subject'] ?? 'eCommerceX OTP Code')
+            ->withSymfonyMessage(function ($message) {
+                $headers = $message->getHeaders();
+                $headers->addTextHeader('X-Auto-Response-Suppress', 'All');
+                $headers->addTextHeader('X-eCommerceX-Email-Type', 'otp');
+            })
+            ->view('email.otp_send')
+            ->text('email.otp_send_text');
     }
 
     /**

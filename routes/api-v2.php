@@ -45,6 +45,7 @@ use App\Http\Controllers\WhatsAppAutomation\AnalyticsController;
 use App\Http\Controllers\WhatsAppAutomation\TrainingController;
 use App\Http\Controllers\WhatsAppAutomation\CohortController;
 use App\Http\Controllers\WhatsAppAutomation\LiveClientShowcaseController;
+use App\Http\Controllers\WhatsAppAutomation\GatewaySessionController;
 
 
 /*
@@ -65,6 +66,10 @@ Route::prefix('whatsapp')->group(function () {
         Route::get('/auth/me', [AuthController::class, 'me']);
         Route::post('/auth/logout', [AuthController::class, 'logout']);
         Route::get('/dashboard', [DashboardController::class, 'index']);
+        Route::post('/gateway/sessions/create', [GatewaySessionController::class, 'create']);
+        Route::get('/gateway/sessions/{tenantId}/status', [GatewaySessionController::class, 'status']);
+        Route::get('/gateway/sessions/{tenantId}/qr', [GatewaySessionController::class, 'qr']);
+        Route::match(['get', 'post', 'delete'], '/gateway/sessions/{tenantId}/logout', [GatewaySessionController::class, 'logout']);
         Route::get('/realtime/stream', [RealtimeController::class, 'stream']);
         Route::get('/realtime/events', [RealtimeController::class, 'events']);
         Route::get('/leads', [LeadController::class, 'index']);

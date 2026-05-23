@@ -3,6 +3,7 @@
 namespace App\Services\WhatsAppAutomation;
 
 use Illuminate\Http\Client\PendingRequest;
+use Illuminate\Http\Client\Response;
 use Illuminate\Support\Facades\Http;
 
 class BotApiService
@@ -23,6 +24,34 @@ class BotApiService
         return Http::baseUrl($baseUrl)
             ->withOptions([
                 'connect_timeout' => 30,
+            ])
+            ->timeout(90)
+            ->retry(3, 2000)
+            ->acceptJson()
+            ->withHeaders([
+                'X-Admin-Token' => $adminToken,
+                'X-API-Secret' => $adminToken,
+                'X-Gateway-Secret' => $adminToken,
+                'Authorization' => 'Bearer ' . $adminToken,
+            ]);
+    }
+
+    protected function gatewayClient(): PendingRequest
+    {
+        $baseUrl = rtrim((string) config('whatsapp_automation.gateway_api_url'), '/');
+        $apiSecret = (string) config('whatsapp_automation.gateway_api_secret');
+
+        if ($baseUrl === '') {
+            throw new \RuntimeException('WHATSAPP_GATEWAY_API_URL is not configured.');
+        }
+
+        if ($apiSecret === '') {
+            throw new \RuntimeException('WHATSAPP_GATEWAY_API_SECRET is not configured.');
+        }
+
+        return Http::baseUrl($baseUrl)
+            ->withOptions([
+                'connect_timeout' => 30,
                 'curl' => [
                     CURLOPT_IPRESOLVE => CURL_IPRESOLVE_V4,
                 ],
@@ -31,7 +60,9 @@ class BotApiService
             ->retry(3, 2000)
             ->acceptJson()
             ->withHeaders([
-                'X-Admin-Token' => $adminToken,
+                'X-API-Secret' => $apiSecret,
+                'X-Gateway-Secret' => $apiSecret,
+                'Authorization' => 'Bearer ' . $apiSecret,
             ]);
     }
 
@@ -172,6 +203,29 @@ class BotApiService
     {
         $response = $this->client()->post("/dispatch/outbound/{$outboundId}");
         return $response->throw()->json();
+    }
+
+    public function sendGatewayTextMessage(string $tenantId, string $phoneNumber, string $message): array
+    {
+        $response = $this->gatewayClient()->post('/api/messages/send', [
+            'tenantId' => $tenantId,
+            'phoneNumber' => $phoneNumber,
+            'message' => $message,
+        ]);
+
+        $json = $response->json();
+        $payload = is_array($json) ? $json : [];
+
+        if ($response->successful()) {
+            return $payload + ['success' => true];
+        }
+
+        return [
+            'success' => false,
+            'status_code' => $response->status(),
+            'message' => $this->gatewayMessage($response, $payload),
+            'details' => $payload,
+        ];
     }
 
     public function getReviewQueue(string $queue, array $query = []): array
@@ -517,5 +571,181 @@ class BotApiService
         ]);
 
         return $response->throw()->json();
+    }
+
+    protected function gatewayPayload(Response $response, string $tenantId): array
+    {
+        $json = $response->json();
+        $payload = is_array($json) ? $json : [];
+
+        if ($response->successful()) {
+            return $payload + [
+                'success' => true,
+                'tenant_id' => $tenantId,
+            ];
+        }
+
+        if ($response->status() === 404) {
+            return [
+                'success' => true,
+                'tenant_id' => $tenantId,
+                'status' => 'not_found',
+                'message' => 'Gateway session was not found.',
+            ];
+        }
+
+        return [
+            'success' => false,
+            'tenant_id' => $tenantId,
+            'status' => 'gateway_error',
+            'status_code' => $response->status(),
+            'message' => $this->gatewayMessage($response, $payload),
+            'details' => $payload,
+        ];
+    }
+
+    protected function gatewayMessage(Response $response, array $payload = []): string
+    {
+        $message = $payload['message'] ?? $payload['error'] ?? $payload['detail'] ?? null;
+
+        if (! is_string($message) || trim($message) === '') {
+            $message = (string) $response->body();
+        }
+
+        $message = trim(strip_tags($message));
+
+        if ($message === '' || str_contains(strtolower($message), 'doctype html')) {
+            return 'WhatsApp gateway request failed.';
+        }
+
+        return mb_substr(preg_replace('/\s+/', ' ', $message) ?: $message, 0, 220);
+    }
+
+    protected function requestGatewayCandidates(array $candidates, string $tenantId, bool $sessionLookup = false): array
+    {
+        $notFound = null;
+        $failed = null;
+
+        foreach ($candidates as $candidate) {
+            $method = strtolower($candidate['method'] ?? 'get');
+            $url = $candidate['url'] ?? '/';
+            $payload = $candidate['payload'] ?? [];
+            $query = $candidate['query'] ?? [];
+
+            $response = match ($method) {
+                'post' => $this->gatewayClient()->post($url, $payload),
+                'delete' => $this->gatewayClient()->delete($url, $payload),
+                default => $this->gatewayClient()->get($url, $query),
+            };
+
+            if ($response->successful()) {
+                return $this->gatewayPayload($response, $tenantId);
+            }
+
+            if ($response->status() === 404) {
+                $notFound = $response;
+                continue;
+            }
+
+            if ($response->status() === 405) {
+                $failed = $response;
+                continue;
+            }
+
+            return $this->gatewayPayload($response, $tenantId);
+        }
+
+        if ($notFound) {
+            if ($sessionLookup) {
+                return $this->gatewayPayload($notFound, $tenantId);
+            }
+
+            return [
+                'success' => false,
+                'tenant_id' => $tenantId,
+                'status' => 'gateway_route_not_found',
+                'status_code' => 404,
+                'message' => 'WhatsApp gateway session endpoint was not found. Set WHATSAPP_GATEWAY_API_URL to the WhatsApp_GateWay service URL.',
+            ];
+        }
+
+        return $failed
+            ? $this->gatewayPayload($failed, $tenantId)
+            : [
+                'success' => false,
+                'tenant_id' => $tenantId,
+                'status' => 'gateway_error',
+                'message' => 'WhatsApp gateway request failed.',
+            ];
+    }
+
+    public function createGatewaySession(string $tenantId): array
+    {
+        $tenantPath = rawurlencode($tenantId);
+
+        return $this->requestGatewayCandidates([
+            ['method' => 'post', 'url' => '/api/sessions/create', 'payload' => ['tenantId' => $tenantId]],
+            ['method' => 'post', 'url' => '/api/sessions/create', 'payload' => ['tenant_id' => $tenantId]],
+            ['method' => 'post', 'url' => '/gateway/sessions/create', 'payload' => ['tenant_id' => $tenantId]],
+            ['method' => 'post', 'url' => '/gateway/sessions/create', 'payload' => ['tenantId' => $tenantId]],
+            ['method' => 'post', 'url' => '/sessions/create', 'payload' => ['tenant_id' => $tenantId]],
+            ['method' => 'post', 'url' => '/sessions/create', 'payload' => ['tenantId' => $tenantId]],
+            ['method' => 'post', 'url' => '/gateway/session/create', 'payload' => ['tenant_id' => $tenantId]],
+            ['method' => 'post', 'url' => '/gateway/session/create', 'payload' => ['tenantId' => $tenantId]],
+            ['method' => 'post', 'url' => '/sessions', 'payload' => ['tenant_id' => $tenantId]],
+            ['method' => 'post', 'url' => '/sessions', 'payload' => ['tenantId' => $tenantId]],
+            ['method' => 'post', 'url' => "/sessions/{$tenantPath}/create"],
+            ['method' => 'post', 'url' => "/gateway/sessions/{$tenantPath}/create"],
+        ], $tenantId);
+    }
+
+    public function getGatewaySessionStatus(string $tenantId): array
+    {
+        $tenantPath = rawurlencode($tenantId);
+
+        return $this->requestGatewayCandidates([
+            ['method' => 'get', 'url' => "/api/sessions/{$tenantPath}/status"],
+            ['method' => 'get', 'url' => "/gateway/sessions/{$tenantPath}/status"],
+            ['method' => 'get', 'url' => "/sessions/{$tenantPath}/status"],
+            ['method' => 'get', 'url' => "/gateway/session/{$tenantPath}/status"],
+            ['method' => 'get', 'url' => '/api/sessions/status', 'query' => ['tenantId' => $tenantId]],
+            ['method' => 'get', 'url' => '/gateway/sessions/status', 'query' => ['tenant_id' => $tenantId]],
+            ['method' => 'get', 'url' => '/sessions/status', 'query' => ['tenant_id' => $tenantId]],
+            ['method' => 'get', 'url' => '/sessions/status', 'query' => ['tenantId' => $tenantId]],
+        ], $tenantId, true);
+    }
+
+    public function getGatewaySessionQr(string $tenantId): array
+    {
+        $tenantPath = rawurlencode($tenantId);
+
+        return $this->requestGatewayCandidates([
+            ['method' => 'get', 'url' => "/api/sessions/{$tenantPath}/qr"],
+            ['method' => 'get', 'url' => "/gateway/sessions/{$tenantPath}/qr"],
+            ['method' => 'get', 'url' => "/sessions/{$tenantPath}/qr"],
+            ['method' => 'get', 'url' => "/gateway/session/{$tenantPath}/qr"],
+            ['method' => 'get', 'url' => '/api/sessions/qr', 'query' => ['tenantId' => $tenantId]],
+            ['method' => 'get', 'url' => '/gateway/sessions/qr', 'query' => ['tenant_id' => $tenantId]],
+            ['method' => 'get', 'url' => '/sessions/qr', 'query' => ['tenant_id' => $tenantId]],
+            ['method' => 'get', 'url' => '/sessions/qr', 'query' => ['tenantId' => $tenantId]],
+        ], $tenantId, true);
+    }
+
+    public function logoutGatewaySession(string $tenantId): array
+    {
+        $tenantPath = rawurlencode($tenantId);
+
+        return $this->requestGatewayCandidates([
+            ['method' => 'post', 'url' => "/api/sessions/{$tenantPath}/logout"],
+            ['method' => 'post', 'url' => "/gateway/sessions/{$tenantPath}/logout"],
+            ['method' => 'post', 'url' => "/sessions/{$tenantPath}/logout"],
+            ['method' => 'post', 'url' => "/gateway/session/{$tenantPath}/logout"],
+            ['method' => 'post', 'url' => '/api/sessions/logout', 'payload' => ['tenantId' => $tenantId]],
+            ['method' => 'post', 'url' => '/gateway/sessions/logout', 'payload' => ['tenant_id' => $tenantId]],
+            ['method' => 'post', 'url' => '/sessions/logout', 'payload' => ['tenant_id' => $tenantId]],
+            ['method' => 'delete', 'url' => "/api/sessions/{$tenantPath}"],
+            ['method' => 'delete', 'url' => "/gateway/sessions/{$tenantPath}"],
+            ['method' => 'delete', 'url' => "/sessions/{$tenantPath}"],
+        ], $tenantId);
     }
 }

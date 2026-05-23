@@ -75,6 +75,7 @@ use App\Services\WhatsAppAutomation\BotApiService;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Auth;
+use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Hash;
 use Illuminate\Support\Facades\Log;
@@ -93,6 +94,7 @@ class AdminReactController extends Controller
     private const ACCESS_MODES_SETTING_KEY = 'admin_access_modes_v1';
     private const TRIAL_PERIOD_DAYS_SETTING_KEY = 'trial_period_days';
     private const DEFAULT_TRIAL_PERIOD_DAYS = 14;
+    private const OTP_GATEWAY_TENANT_CACHE_KEY = 'whatsapp_gateway.active_otp_tenant_id';
 
     public function superadminAiFill(Request $request): JsonResponse
     {
@@ -6897,6 +6899,10 @@ class AdminReactController extends Controller
         $folders = $disk->exists($baseDir) ? $disk->directories($baseDir) : [];
 
         $items = collect($files)
+            ->reject(function (string $path) {
+                $name = basename($path);
+                return str_starts_with($name, '.') || str_starts_with($name, '._');
+            })
             ->map(function (string $path) use ($disk) {
                 $name = basename($path);
                 $ext = strtolower(pathinfo($name, PATHINFO_EXTENSION));
@@ -7050,10 +7056,17 @@ class AdminReactController extends Controller
             return response()->json(['message' => 'Missing file path.'], 422);
         }
 
-        $dir = $this->legacyMediaLibraryBaseFromPath($path) ?: $library['baseDir'];
-        $prefix = trim($dir, '/') . '/';
-        if (!str_starts_with($path, $prefix)) {
-            return response()->json(['message' => 'Invalid media path.'], 422);
+        // ai-seed-library is a superadmin-only path not under image-library/
+        if (Str::startsWith($path, 'ai-seed-library/')) {
+            if ($library['scope'] !== 'superadmin') {
+                return response()->json(['message' => 'Super admin media access required.'], 403);
+            }
+        } else {
+            $dir = $this->legacyMediaLibraryBaseFromPath($path) ?: $library['baseDir'];
+            $prefix = trim($dir, '/') . '/';
+            if (!str_starts_with($path, $prefix)) {
+                return response()->json(['message' => 'Invalid media path.'], 422);
+            }
         }
 
         $disk = Storage::disk('public');
@@ -7337,8 +7350,13 @@ class AdminReactController extends Controller
     private function mediaLibraryFileUrl(string $path, ?string $storeId = null): string
     {
         $cleanPath = $this->normalizeMediaLibraryDiskPath($path);
+        $params = ['path' => $cleanPath];
 
-        return rtrim($this->assetOrigin(), '/') . '/storage/' . ltrim($cleanPath, '/');
+        if (Str::startsWith($cleanPath, ['image-library/superadmin/', 'ai-seed-library/'])) {
+            $params['scope'] = 'superadmin';
+        }
+
+        return rtrim($this->assetOrigin(), '/') . '/react-admin-api/media-library/file?' . http_build_query($params);
     }
 
     private function mediaStoreIdFromPath(string $path): ?string
@@ -8260,6 +8278,7 @@ class AdminReactController extends Controller
                 $aiPreferences = null;
             }
             app(AiStoreSeedService::class)->seed($store, $customer, $user, $launchMode, $aiPreferences);
+            $store->refresh();
 
             return response()->json([
                 'status' => true,
@@ -8271,6 +8290,7 @@ class AdminReactController extends Controller
                     'slug' => $slug,
                     'url' => $storeUrl,
                     'custom_domain' => $customDomain,
+                    'template_id' => $store->template_id ?? null,
                     'trial_plan_id' => $trialPlanId,
                     'trial_period_days' => $trialDays,
                     'purchase_date' => $trialStartsAt->toDateString(),
@@ -10796,35 +10816,56 @@ class AdminReactController extends Controller
 
     public function registerRequestOtp(Request $request): JsonResponse
     {
+        $request->merge([
+            'phone' => trim((string) $request->input('phone')) !== '' ? trim((string) $request->input('phone')) : null,
+            'email' => trim((string) $request->input('email')) !== '' ? trim((string) $request->input('email')) : null,
+        ]);
+
         $payload = $request->validate([
             'name' => ['required', 'string', 'max:255'],
-            'phone' => AdminContactValidation::phoneRules(true),
+            'phone' => AdminContactValidation::phoneRules(false),
             'email' => AdminContactValidation::emailRules(false, 255),
             'password' => ['required', 'string', 'min:8', 'confirmed'],
             'user_type' => ['required', 'in:admin,dropshipper'],
         ]);
 
-        $this->ensureRegistrationIsAvailable($payload['phone'], $payload['email'] ?? null);
+        $phoneTarget = trim((string) ($payload['phone'] ?? ''));
+        $emailTarget = trim((string) ($payload['email'] ?? ''));
+
+        if ($phoneTarget === '' && $emailTarget === '') {
+            throw ValidationException::withMessages([
+                'message' => 'Phone number or email address is required.',
+            ]);
+        }
+
+        $this->ensureRegistrationIsAvailable($phoneTarget !== '' ? $phoneTarget : null, $emailTarget !== '' ? $emailTarget : null);
 
         $otp = sixDigitRandCode();
-        $otpTarget = !empty($payload['email']) ? $payload['email'] : $payload['phone'];
+        $otpTarget = $phoneTarget !== '' ? $phoneTarget : $emailTarget;
 
         $request->session()->put(self::REGISTRATION_SESSION_KEY, [
             'name' => $payload['name'],
-            'phone' => $payload['phone'],
-            'email' => $payload['email'] ?? null,
+            'phone' => $phoneTarget !== '' ? $phoneTarget : null,
+            'email' => $emailTarget !== '' ? $emailTarget : null,
             'password_hash' => Hash::make($payload['password']),
             'user_type' => $payload['user_type'],
             'otp' => $otp,
             'target' => $otpTarget,
+            'email_target' => $emailTarget !== '' ? $emailTarget : null,
         ]);
 
-        $this->sendOtp($otpTarget, $otp, 'Registration', $payload['name']);
+        $this->sendRegistrationOtp(
+            $phoneTarget !== '' ? $phoneTarget : null,
+            $emailTarget !== '' ? $emailTarget : null,
+            $otp,
+            $payload['name']
+        );
 
         return response()->json([
             'success' => true,
             'message' => 'OTP sent successfully.',
             'target' => $otpTarget,
+            'channels' => $this->registrationOtpChannels($phoneTarget, $emailTarget),
             'flow' => 'registration',
             'user_type' => $payload['user_type'],
         ]);
@@ -10843,12 +10884,18 @@ class AdminReactController extends Controller
         $pending['otp'] = sixDigitRandCode();
         $request->session()->put(self::REGISTRATION_SESSION_KEY, $pending);
 
-        $this->sendOtp($pending['target'], $pending['otp'], 'Registration', $pending['name'] ?? '');
+        $this->sendRegistrationOtp(
+            $pending['phone'] ?? null,
+            $pending['email_target'] ?? $pending['email'] ?? null,
+            $pending['otp'],
+            $pending['name'] ?? ''
+        );
 
         return response()->json([
             'success' => true,
             'message' => 'OTP sent successfully.',
-            'target' => $pending['target'],
+            'target' => $pending['target'] ?? $pending['phone'] ?? $pending['email'] ?? null,
+            'channels' => $this->registrationOtpChannels($pending['phone'] ?? null, $pending['email_target'] ?? $pending['email'] ?? null),
         ]);
     }
 
@@ -10872,11 +10919,11 @@ class AdminReactController extends Controller
             ], 422);
         }
 
-        $this->ensureRegistrationIsAvailable($pending['phone'], $pending['email'] ?? null);
+        $this->ensureRegistrationIsAvailable($pending['phone'] ?? null, $pending['email'] ?? null);
 
         $user = new User();
         $user->name = $pending['name'];
-        $user->phone = $pending['phone'];
+        $user->phone = $pending['phone'] ?? null;
         $user->email = $pending['email'] ?: null;
         $user->password = $pending['password_hash'];
         $user->type = $pending['user_type'];
@@ -11400,8 +11447,13 @@ class AdminReactController extends Controller
 
     private function assetOrigin(): string
     {
+        $requestOrigin = request()->getSchemeAndHttpHost();
+        if ($requestOrigin !== '') {
+            return rtrim($requestOrigin, '/');
+        }
+
         $configuredAppUrl = trim((string) config('app.url'));
-        return rtrim($configuredAppUrl !== '' ? $configuredAppUrl : request()->getSchemeAndHttpHost(), '/');
+        return rtrim($configuredAppUrl !== '' ? $configuredAppUrl : '', '/');
     }
 
     private function extractAddonText($value): string
@@ -12226,20 +12278,25 @@ class AdminReactController extends Controller
             ->all());
     }
 
-    private function ensureRegistrationIsAvailable(string $phone, ?string $email): void
+    private function ensureRegistrationIsAvailable(?string $phone, ?string $email): void
     {
-        $existingPhone = User::query()
-            ->where('phone', $phone)
-            ->whereIn('type', ['admin', 'dropshipper'])
-            ->exists();
+        $phone = trim((string) $phone);
+        $email = trim((string) $email);
 
-        if ($existingPhone) {
-            abort(response()->json([
-                'message' => 'Phone number already exists. Please login your account.',
-            ], 422));
+        if ($phone !== '') {
+            $existingPhone = User::query()
+                ->where('phone', $phone)
+                ->whereIn('type', ['admin', 'dropshipper'])
+                ->exists();
+
+            if ($existingPhone) {
+                abort(response()->json([
+                    'message' => 'Phone number already exists. Please login your account.',
+                ], 422));
+            }
         }
 
-        if ($email) {
+        if ($email !== '') {
             $existingEmail = User::query()
                 ->where('email', $email)
                 ->whereIn('type', ['admin', 'dropshipper'])
@@ -12258,8 +12315,11 @@ class AdminReactController extends Controller
         if (filter_var($target, FILTER_VALIDATE_EMAIL)) {
             $data['name'] = $name ?: $target;
             $data['subject'] = $subject;
-            $data['text'] = "eCommerceX OTP code is <span style='font-size: 24px;'>{$otp}</span>";
-            $data['formEmail'] = env('MAIL_FROM_ADDRESS');
+            $data['otp'] = $otp;
+            $data['text'] = "Your eCommerceX OTP code is <strong style='font-size: 24px;letter-spacing:4px;'>{$otp}</strong>";
+            $data['plainText'] = "Your eCommerceX OTP code is {$otp}. If you did not request this code, you can ignore this email.";
+            $data['formEmail'] = config('mail.from.address');
+            $data['fromName'] = config('mail.from.name', 'eCommerceX');
 
             Mail::to($target)->send(new OPTSendMail($data));
 
@@ -12269,6 +12329,54 @@ class AdminReactController extends Controller
         $text = "eCommerceX OTP code is {$otp}";
         $this->sendWhatsAppOtp($target, $text, $subject);
         smsLogger($target, $text, "{$subject} WhatsApp OTP Send");
+    }
+
+    private function sendRegistrationOtp(?string $phone, ?string $email, string $otp, string $name = ''): void
+    {
+        $phone = trim((string) $phone);
+        $email = trim((string) $email);
+        $errors = [];
+
+        if ($phone !== '') {
+            try {
+                $this->sendOtp($phone, $otp, 'Registration', $name);
+            } catch (\Throwable $exception) {
+                $errors['phone'] = 'Unable to send OTP on WhatsApp. Please try again shortly.';
+                Log::warning('React admin registration OTP WhatsApp failed.', [
+                    'phone' => $phone,
+                    'error' => $exception->getMessage(),
+                ]);
+            }
+        }
+
+        if ($email !== '' && filter_var($email, FILTER_VALIDATE_EMAIL)) {
+            try {
+                $this->sendOtp($email, $otp, 'Registration', $name);
+            } catch (\Throwable $exception) {
+                $errors['email'] = 'Unable to send OTP by email. Please check mail settings and try again.';
+                Log::warning('React admin registration OTP email failed.', [
+                    'email' => $email,
+                    'error' => $exception->getMessage(),
+                ]);
+            }
+        }
+
+        if ($phone === '' && $email === '') {
+            $errors['message'] = 'Phone number or email address is required.';
+        }
+
+        if (!empty($errors)) {
+            $errors['message'] = $errors['message'] ?? implode(' ', array_values($errors));
+            throw ValidationException::withMessages($errors);
+        }
+    }
+
+    private function registrationOtpChannels(?string $phone, ?string $email): array
+    {
+        return array_values(array_filter([
+            trim((string) $phone) !== '' ? 'whatsapp' : null,
+            trim((string) $email) !== '' ? 'email' : null,
+        ]));
     }
 
     private function sendWhatsAppOtp(string $target, string $text, string $subject): void
@@ -12301,31 +12409,56 @@ class AdminReactController extends Controller
         }
 
         $botApi = app(BotApiService::class);
-        $queued = $botApi->createOutbound([
-            'session_id' => $sessionId,
-            'bot_type' => (string) config('whatsapp_automation.otp_bot_type', 'support'),
-            'source_type' => $sourceType,
-            'message_type' => 'text',
-            'message_text' => $message,
-            'image_url' => '',
-            'scheduled_for' => null,
-        ]);
+        $queueError = null;
 
-        $outboundId = (int) ($queued['outbound_id'] ?? 0);
+        try {
+            $queued = $botApi->createOutbound([
+                'session_id' => $sessionId,
+                'bot_type' => (string) config('whatsapp_automation.otp_bot_type', 'support'),
+                'source_type' => $sourceType,
+                'message_type' => 'text',
+                'message_text' => $message,
+                'image_url' => '',
+                'scheduled_for' => null,
+            ]);
 
-        if ($outboundId > 0) {
-            try {
-                $botApi->dispatchOutbound($outboundId);
-            } catch (\Throwable $exception) {
-                Log::warning('React admin WhatsApp OTP dispatch failed after queue.', [
-                    'target' => $target,
-                    'outbound_id' => $outboundId,
-                    'error' => $exception->getMessage(),
-                ]);
+            $outboundId = (int) ($queued['outbound_id'] ?? 0);
+
+            if ($outboundId > 0) {
+                $dispatch = $botApi->dispatchOutbound($outboundId);
+                if (($dispatch['success'] ?? false) !== true) {
+                    throw new \RuntimeException((string) ($dispatch['error'] ?? 'WhatsApp dispatch failed.'));
+                }
             }
+
+            return $queued;
+        } catch (\Throwable $exception) {
+            $queueError = $exception;
+            Log::warning('React admin WhatsApp OTP queue/dispatch failed.', [
+                'target' => $target,
+                'error' => $exception->getMessage(),
+            ]);
         }
 
-        return $queued;
+        $tenantId = $this->activeWhatsAppOtpTenantId();
+        if ($tenantId !== '') {
+            $direct = $botApi->sendGatewayTextMessage($tenantId, $sessionId, $message);
+            if (($direct['success'] ?? false) === true) {
+                return $direct;
+            }
+
+            throw new \RuntimeException((string) ($direct['message'] ?? 'Direct WhatsApp gateway send failed.'));
+        }
+
+        throw $queueError ?: new \RuntimeException('WhatsApp OTP dispatch failed.');
+    }
+
+    private function activeWhatsAppOtpTenantId(): string
+    {
+        return trim((string) (
+            Cache::get(self::OTP_GATEWAY_TENANT_CACHE_KEY)
+            ?: config('whatsapp_automation.otp_gateway_tenant_id', '')
+        ));
     }
 
     private function normalizeWhatsAppSessionId(string $phone): ?string

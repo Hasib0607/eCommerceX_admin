@@ -140,9 +140,43 @@ class AdminReactDesignController extends Controller
             $design->editor = $userId;
             $design->header_color = '#ffffff';
             $design->text_color = '#000000';
+            $templateId = $this->storedTemplateId($storeId, $customerId);
+            if ($templateId > 0 && Schema::hasColumn('designs', 'template_id')) {
+                $design->template_id = $templateId;
+            }
             $design->save();
         }
         return $design;
+    }
+
+    private function storedTemplateId(int $storeId, int $customerId): int
+    {
+        $storeTemplateId = Schema::hasTable('stores') && Schema::hasColumn('stores', 'template_id')
+            ? (int) (Store::query()->where('id', $storeId)->value('template_id') ?? 0)
+            : 0;
+        if ($storeTemplateId > 0) {
+            return $storeTemplateId;
+        }
+
+        return Schema::hasTable('customers') && Schema::hasColumn('customers', 'template_id')
+            ? (int) (Customer::query()->where('id', $customerId)->value('template_id') ?? 0)
+            : 0;
+    }
+
+    private function activeTemplateIdForStore(int $storeId, int $customerId, ?Design $design = null): int
+    {
+        $activeTemplateId = (int) ($design->template_id ?? 0);
+        if ($activeTemplateId > 0) {
+            return $activeTemplateId;
+        }
+
+        $storedTemplateId = $this->storedTemplateId($storeId, $customerId);
+        if ($storedTemplateId > 0 && $design && Schema::hasColumn('designs', 'template_id')) {
+            $design->template_id = $storedTemplateId;
+            $design->save();
+        }
+
+        return $storedTemplateId;
     }
 
     private function decodeSectionSettings(Design $design): array
@@ -275,15 +309,29 @@ class AdminReactDesignController extends Controller
             return $path;
         }
 
-        if (str_contains($path, '/')) {
-            return url(ltrim($path, '/'));
+        $normalized = ltrim(str_replace('\\', '/', $path), '/');
+
+        if (Str::startsWith($normalized, 'storage/image-library/') || Str::startsWith($normalized, 'storage/ai-seed-library/')) {
+            return url('/react-admin-api/media-library/file?path=' . rawurlencode(Str::after($normalized, 'storage/')));
+        }
+
+        if (Str::startsWith($normalized, ['image-library/', 'ai-seed-library/'])) {
+            return url('/react-admin-api/media-library/file?path=' . rawurlencode($normalized));
+        }
+
+        if (Str::startsWith($normalized, ['storage/', 'assets/'])) {
+            return url($normalized);
+        }
+
+        if (str_contains($normalized, '/')) {
+            return url($normalized);
         }
 
         if ($directory === '') {
-            return url(ltrim($path, '/'));
+            return url($normalized);
         }
 
-        return url(trim($directory, '/') . '/' . ltrim($path, '/'));
+        return url(trim($directory, '/') . '/' . $normalized);
     }
 
     private function menuLabel(Menu $menu): string
@@ -721,7 +769,7 @@ class AdminReactDesignController extends Controller
         $categoryFilter = trim((string) $request->query('category', ''));
         $pricingFilter = trim((string) $request->query('pricing', 'all')); // all|free|paid
         $activeDesign = Design::where('store_id', $storeId)->first();
-        $activeTemplateId = (int) ($activeDesign->template_id ?? 0);
+        $activeTemplateId = $this->activeTemplateIdForStore($storeId, (int) $ctx['customer_id'], $activeDesign);
 
         $query = Template::query()->where('status', 'active')->orderBy('position', 'asc')->orderByDesc('id');
         if ($keyword !== '') {
@@ -854,6 +902,12 @@ class AdminReactDesignController extends Controller
         $design->template_id = $template->id;
         $design->editor = (int) $ctx['user_id'];
         $design->save();
+        if (Schema::hasColumn('stores', 'template_id')) {
+            Store::query()->where('id', (int) $ctx['store_id'])->update(['template_id' => $template->id]);
+        }
+        if (Schema::hasColumn('customers', 'template_id')) {
+            Customer::query()->where('id', (int) $ctx['customer_id'])->update(['template_id' => $template->id]);
+        }
         return response()->json(['success' => true]);
     }
 
@@ -998,7 +1052,7 @@ class AdminReactDesignController extends Controller
                 'occupation' => (string) ($t->occupation ?? ''),
                 'feedback' => (string) ($t->feedback ?? ''),
                 'image' => (string) ($t->image ?? ''),
-                'image_url' => $t->image ? url('assets/images/testimonials/' . ltrim($t->image, '/')) : null,
+                'image_url' => $this->previewAssetUrl($t->image ?? null, 'assets/images/testimonials'),
                 'position' => (int) ($t->position ?? 0),
                 'status' => (string) ($t->status ?? 'inactive'),
             ])->values(),
@@ -1077,11 +1131,42 @@ class AdminReactDesignController extends Controller
         }
 
         if (!empty($payload['image_media_path'])) {
-            return getLibraryImagePath((string) $payload['image_media_path']);
+            return $this->normalizeStoredMediaReference((string) $payload['image_media_path']);
         }
 
         $existing = trim((string) ($payload['image'] ?? ''));
         return $existing !== '' ? $existing : null;
+    }
+
+    private function normalizeStoredMediaReference(string $value): string
+    {
+        $path = trim($value);
+        if ($path === '') {
+            return '';
+        }
+
+        if (str_contains($path, 'media-library/file?')) {
+            $query = parse_url($path, PHP_URL_QUERY);
+            if (is_string($query) && $query !== '') {
+                parse_str($query, $params);
+                $path = (string) ($params['path'] ?? $path);
+            }
+        }
+
+        $appUrl = rtrim((string) config('app.url'), '/');
+        if ($appUrl !== '' && str_starts_with($path, $appUrl)) {
+            $path = substr($path, strlen($appUrl));
+        }
+
+        $path = ltrim(str_replace('\\', '/', $path), '/');
+        if (str_starts_with($path, 'storage/')) {
+            return $path;
+        }
+        if (str_starts_with($path, ['image-library/', 'ai-seed-library/'])) {
+            return 'storage/' . $path;
+        }
+
+        return getLibraryImagePath($path);
     }
 
     private function storeUploadedTestimonialImage($file): string

@@ -11,6 +11,8 @@ use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Hash;
 
+use App\Support\AdminContactValidation;
+
 class AdminReactCustomerController extends Controller
 {
     private function resolveContext(): array
@@ -103,8 +105,8 @@ class AdminReactCustomerController extends Controller
     {
         $payload = $request->validate([
             'name' => ['required', 'string', 'max:255'],
-            'email' => ['nullable', 'string', 'max:255'],
-            'phone' => ['nullable', 'string', 'max:50'],
+            'email' => AdminContactValidation::emailRules(false, 255),
+            'phone' => AdminContactValidation::phoneRules(false, 50),
             'password' => ['nullable', 'string', 'max:255'],
             'address' => ['nullable', 'string'],
         ]);

@@ -1465,9 +1465,34 @@ if (!function_exists('getVariantImagePath')) {
 if (!function_exists('getLibraryImagePath')) {
     function getLibraryImagePath($image)
     {
-        $imagePath = "";
-        if (isset($image) && !empty($image)) {
-            $imagePath = trim(str_replace(env("APP_URL"), "", $image), '/');
+        if (!isset($image) || $image === null || $image === '') {
+            return '';
+        }
+
+        $imagePath = trim((string) $image);
+        if ($imagePath === '') {
+            return '';
+        }
+
+        if (str_contains($imagePath, 'media-library/file?')) {
+            $query = parse_url($imagePath, PHP_URL_QUERY);
+            if (is_string($query) && $query !== '') {
+                parse_str($query, $params);
+                $imagePath = (string) ($params['path'] ?? $imagePath);
+            }
+        }
+
+        $appUrl = rtrim((string) config('app.url'), '/');
+        if ($appUrl !== '' && str_starts_with($imagePath, $appUrl)) {
+            $imagePath = substr($imagePath, strlen($appUrl));
+        }
+
+        $imagePath = ltrim(str_replace('\\', '/', $imagePath), '/');
+        if (str_starts_with($imagePath, 'storage/')) {
+            return $imagePath;
+        }
+        if (str_starts_with($imagePath, ['image-library/', 'ai-seed-library/'])) {
+            return 'storage/' . $imagePath;
         }
 
         return $imagePath;
