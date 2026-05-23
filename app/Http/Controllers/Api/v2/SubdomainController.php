@@ -552,7 +552,7 @@ class SubdomainController extends Controller
             ? $query->orderByDesc('products.created_at')
             : $query->orderBy('products.position', 'ASC');
 
-        return $query->limit(12)
+        return $query->with(['variant:id,pid,image,color_image'])->limit(12)
             ->get()
             ->map(fn ($product) => $this->storefrontProductCard($product, $store))
             ->values()
@@ -616,11 +616,56 @@ class SubdomainController extends Controller
 
     private function storefrontProductImages($product): array
     {
-        $images = $product->images ? explode(',', $product->images) : [];
-        $gallery = $product->gallery_image ? explode(',', $product->gallery_image) : [];
-        $merged = array_values(array_unique(array_filter(array_merge($gallery, $images))));
+        $merged = $this->productImageTokens($product);
+
+        if (empty($merged) && isset($product->variant) && count($product->variant) > 0) {
+            $merged = $this->variantImageTokens($product->variant);
+        }
 
         return array_values(array_map(fn ($image) => $this->storefrontImage($image, 'assets/images/product'), $merged));
+    }
+
+    private function productImageTokens($product): array
+    {
+        $images = !empty($product->images) ? explode(',', (string) $product->images) : [];
+        $gallery = !empty($product->gallery_image) ? explode(',', (string) $product->gallery_image) : [];
+
+        return array_values(array_unique(array_filter(array_merge($gallery, $images), function ($token) {
+            return trim((string) $token) !== '';
+        })));
+    }
+
+    private function variantImageTokens($variants): array
+    {
+        return collect($variants)
+            ->flatMap(function ($variant) {
+                if (is_array($variant)) {
+                    return [
+                        trim((string) ($variant['image'] ?? '')),
+                        trim((string) ($variant['color_image'] ?? '')),
+                    ];
+                }
+
+                return [
+                    trim((string) ($variant->image ?? '')),
+                    trim((string) ($variant->color_image ?? '')),
+                ];
+            })
+            ->filter(fn ($token) => $token !== '')
+            ->unique()
+            ->values()
+            ->all();
+    }
+
+    public function resolveProductImageUrls($product, $variants = null): array
+    {
+        $tokens = $this->productImageTokens($product);
+
+        if (empty($tokens) && $variants !== null) {
+            return $this->variantImageTokens($variants);
+        }
+
+        return array_values(array_map(fn ($img) => getPath($img, 'assets/images/product'), $tokens));
     }
 
     private function storefrontImage($value, ?string $folder = null): ?array
@@ -988,19 +1033,6 @@ class SubdomainController extends Controller
 
     public function getSingleProductResponse($product, $store_id)
     {
-        // Prepare each product's data
-        $cacheKey = "product_images_{$product->id}";
-        $images = Cache::remember($cacheKey, 60, function () use ($product) {
-            $images = $product->images ? explode(',', $product->images) : [];
-            $gallery_image = $product->gallery_image ? explode(',', $product->gallery_image) : [];
-            $merged = array_filter(array_merge($gallery_image, $images));
-            return array_values(array_map(fn($img) => getPath($img, 'assets/images/product'), array_unique($merged)));
-        });
-
-
-        $averageRating = $product->reviews_count > 0 ? $product->reviews_sum_rating / $product->reviews_count : 0;
-
-        // Convert currency for variants
         $variants = $product->getVariantsWithConversion($store_id)->get()->map(function ($variant) {
             return [
                 'id' => $variant->id,
@@ -1018,6 +1050,13 @@ class SubdomainController extends Controller
                 'code' => $variant->code,
             ];
         });
+
+        $cacheKey = "product_images_{$product->id}";
+        $images = Cache::remember($cacheKey, 60, function () use ($product, $variants) {
+            return $this->resolveProductImageUrls($product, $variants);
+        });
+
+        $averageRating = $product->reviews_count > 0 ? $product->reviews_sum_rating / $product->reviews_count : 0;
 
         $discount_price = $product->regular_price <= $product->promotional_price ? "0" : $product->promotional_price;
 
@@ -1744,15 +1783,6 @@ class SubdomainController extends Controller
             ->first();
 
         if (isset($product)) {
-            // Prepare each product's data
-            $images = array_filter(explode(',', $product->images));
-            $gallery_image = array_filter(explode(',', $product->gallery_image));
-            $mergedImages = array_unique(array_merge($gallery_image, $images));
-            $images = array_map(fn($img) => getPath($img, 'assets/images/product'), $mergedImages);
-
-            $averageRating = $product->reviews_count > 0 ? $product->reviews_sum_rating / $product->reviews_count : 0;
-
-            // Convert currency for variants
             $variants = $product->getVariantsWithConversion($store)->get()->map(function ($variant) {
                 return [
                     'id' => $variant->id,
@@ -1770,6 +1800,10 @@ class SubdomainController extends Controller
                     'code' => $variant->code,
                 ];
             });
+
+            $images = $this->resolveProductImageUrls($product, $variants);
+
+            $averageRating = $product->reviews_count > 0 ? $product->reviews_sum_rating / $product->reviews_count : 0;
 
             $uniqueColors = collect($variants)
                 ->filter(fn($vr) => isset($vr['color']) && !empty(trim($vr['color']))) // Ensure color exists and is not empty

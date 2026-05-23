@@ -1531,7 +1531,7 @@ if (!function_exists('isMediaLibraryPath')) {
             $cleanPath = substr($cleanPath, strlen('storage/'));
         }
 
-        return str_starts_with($cleanPath, ['image-library/', 'ai-seed-library/', 'react-admin-media/']);
+        return \Illuminate\Support\Str::startsWith($cleanPath, ['image-library/', 'ai-seed-library/', 'react-admin-media/']);
     }
 }
 

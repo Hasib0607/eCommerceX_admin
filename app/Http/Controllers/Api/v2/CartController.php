@@ -378,15 +378,6 @@ class CartController extends Controller
     {
         return $cartItems->map(function ($item) {
             $product = $item->product;
-
-            $images = array_filter(explode(',', $product->images));
-            $gallery_image = array_filter(explode(',', $product->gallery_image));
-            $mergedImages = array_unique(array_merge($gallery_image, $images));
-            $images = array_map(fn($img) => getPath($img, 'assets/images/product'), $mergedImages);
-
-            $averageRating = $product->reviews_count > 0 ? $product->reviews_sum_rating / $product->reviews_count : 0;
-
-            // Prepare variants if exists
             $variants = $product->getVariantsWithConversion($item->store_id)->get()->map(function ($variant) {
                 return [
                     'id' => $variant->id,
@@ -403,6 +394,10 @@ class CartController extends Controller
                     'code' => $variant->code,
                 ];
             });
+
+            $images = (new SubdomainController())->resolveProductImageUrls($product, $variants);
+
+            $averageRating = $product->reviews_count > 0 ? $product->reviews_sum_rating / $product->reviews_count : 0;
 
             $discount_price = $product->regular_price <= $product->promotional_price ? "0" : $product->promotional_price;
             $calculate_regular_price = getPrice($product->regular_price, $discount_price, $product->discount_type);
