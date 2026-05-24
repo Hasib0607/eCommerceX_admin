@@ -73,6 +73,8 @@ Route::prefix('react-admin-api')->group(function () {
         Route::delete('/catalog/variants/{type}/{id}', [AdminReactController::class, 'catalogVariantDelete'])->whereNumber('id');
         Route::get('/media-library', [AdminReactController::class, 'mediaLibraryIndex']);
         Route::get('/media-library/file', [AdminReactController::class, 'mediaLibraryFile']);
+        Route::post('/media-library/image-optimize', [AdminReactController::class, 'mediaLibraryImageOptimizeUpdate']);
+        Route::post('/media-library/optimize-selected', [AdminReactController::class, 'mediaLibraryOptimizeSelected']);
         Route::post('/media-library/upload', [AdminReactController::class, 'mediaLibraryUpload']);
         Route::post('/media-library/folders', [AdminReactController::class, 'mediaLibraryCreateFolder']);
         Route::delete('/media-library', [AdminReactController::class, 'mediaLibraryDelete']);
@@ -349,6 +351,15 @@ Route::prefix('react-admin-api')->group(function () {
     });
 });
 
+/* Legacy panel + design asset paths (DB may reference /assets/images/* while files live on storage disk). */
+Route::get('/assets/images/setting/favicon/{filename}', [AdminReactController::class, 'serveLegacyPanelBrandAsset'])
+    ->where('filename', '[^/]+');
+Route::get('/assets/images/setting/{filename}', [AdminReactController::class, 'serveLegacyPanelBrandAsset'])
+    ->where('filename', '[^/]+');
+Route::get('/assets/images/design/{filename}', [AdminReactController::class, 'serveLegacyCatalogAsset'])
+    ->where('filename', '[^/]+')
+    ->defaults('catalog', 'design');
+
 Route::get('/{path?}', function () {
     $index = public_path('index.html');
     if (!is_file($index)) {
@@ -356,4 +367,4 @@ Route::get('/{path?}', function () {
     }
 
     return response()->file($index);
-})->where('path', '^(?!react-admin-api|api|sanctum).*$');
+})->where('path', '^(?!react-admin-api|api|sanctum|assets/images).*$');

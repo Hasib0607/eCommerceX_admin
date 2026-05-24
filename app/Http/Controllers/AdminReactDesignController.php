@@ -310,6 +310,12 @@ class AdminReactDesignController extends Controller
         }
 
         $normalized = ltrim(str_replace('\\', '/', $path), '/');
+        foreach (['public/storage/', 'storage/app/public/', 'app/public/'] as $prefix) {
+            if (Str::startsWith($normalized, $prefix)) {
+                $normalized = Str::after($normalized, $prefix);
+                break;
+            }
+        }
 
         if (Str::startsWith($normalized, 'storage/image-library/') || Str::startsWith($normalized, 'storage/ai-seed-library/')) {
             return publicMediaLibraryUrl(Str::after($normalized, 'storage/'));

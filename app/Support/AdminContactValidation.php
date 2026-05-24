@@ -62,4 +62,48 @@ class AdminContactValidation
     {
         return strtolower(trim((string) $value));
     }
+
+    /**
+     * Normalize BD/local phones for DB lookup (matches LoginRequest + staff records).
+     */
+    public static function normalizeBdPhoneForStorage(?string $value): string
+    {
+        $digits = preg_replace('/\D/', '', trim((string) $value)) ?? '';
+        if ($digits === '') {
+            return '';
+        }
+
+        if (str_starts_with($digits, '880') && strlen($digits) >= 12) {
+            $digits = substr($digits, 2);
+        }
+
+        if (!str_starts_with($digits, '0') && strlen($digits) === 10) {
+            $digits = '0' . $digits;
+        }
+
+        return $digits;
+    }
+
+    /**
+     * @return list<string>
+     */
+    public static function phoneLoginLookupVariants(?string $value): array
+    {
+        $primary = self::normalizeBdPhoneForStorage($value);
+        if ($primary === '') {
+            return [];
+        }
+
+        $variants = [$primary];
+        $withoutLeadingZero = ltrim($primary, '0');
+        if ($withoutLeadingZero !== '' && $withoutLeadingZero !== $primary) {
+            $variants[] = $withoutLeadingZero;
+        }
+        if ($withoutLeadingZero !== '') {
+            $variants[] = '880' . $withoutLeadingZero;
+            $variants[] = '+880' . $withoutLeadingZero;
+        }
+
+        return array_values(array_unique($variants));
+    }
 }

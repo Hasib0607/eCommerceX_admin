@@ -9,6 +9,7 @@ use Illuminate\Support\Facades\RateLimiter;
 use Illuminate\Support\Str;
 use Illuminate\Validation\ValidationException;
 use App\Models\User;
+use App\Support\AdminLoginUserResolver;
 use Session;
 use Hash;
 
@@ -132,18 +133,10 @@ class LoginRequest extends FormRequest
             $this->merge(['email_or_phone' => $emailOrPhone]);
         }
 
-        $user = User::where(function ($q) use ($isEmail) {
-            if ($isEmail) {
-                $q->where('email', $this->input('email_or_phone'));
-            } else {
-                $q->where('phone', $this->input('email_or_phone'));
-            }
-        })->where(function ($q) {
-            $q->where('type', 'admin')->orWhere('type', 'affiliate')->orWhere('type', 'superadmin')->orWhere('type', 'dropshipper');
-        })->first();
+        $user = AdminLoginUserResolver::resolve((string) $this->input('email_or_phone'), $isEmail);
 
         if (isset($user)) {
-            if (!Hash::check($this->input('password'), $user->password)) {
+            if (!AdminLoginUserResolver::passwordsMatch($user, (string) $this->input('password'))) {
                 RateLimiter::hit($this->throttleKey());
 
                 if ($isEmail) {
@@ -156,10 +149,17 @@ class LoginRequest extends FormRequest
                     ]);
                 }
                 return back()->withInput();
-            } else {
-                Auth::login($user, $this->has('remember'));
-                RateLimiter::clear($this->throttleKey());
             }
+
+            if (!AdminLoginUserResolver::isActive($user)) {
+                RateLimiter::hit($this->throttleKey());
+                throw ValidationException::withMessages([
+                    'email_or_phone' => trans('This staff account is inactive. Contact your administrator.'),
+                ]);
+            }
+
+            Auth::login($user, $this->has('remember'));
+            RateLimiter::clear($this->throttleKey());
         } else {
             RateLimiter::clear($this->throttleKey());
             if ($isEmail) {

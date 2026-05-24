@@ -1516,7 +1516,18 @@ if (!function_exists('publicMediaLibraryUrl')) {
             $cleanPath = substr($cleanPath, strlen('storage/'));
         }
 
-        $base = rtrim((string) config('app.url'), '/');
+        $assetUrl = trim((string) config('app.asset_url'));
+        if ($assetUrl !== '') {
+            $base = rtrim($assetUrl, '/');
+        } else {
+            $base = rtrim((string) config('app.url'), '/');
+        }
+        if ($base === '' && app()->bound('request')) {
+            $request = request();
+            if ($request) {
+                $base = rtrim((string) $request->getSchemeAndHttpHost(), '/');
+            }
+        }
         $query = http_build_query(['path' => $cleanPath]);
 
         return ($base !== '' ? $base : '') . '/react-admin-api/public/media-library/file?' . $query;

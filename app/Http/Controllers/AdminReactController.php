@@ -95,6 +95,7 @@ class AdminReactController extends Controller
     private const TRIAL_PERIOD_DAYS_SETTING_KEY = 'trial_period_days';
     private const DEFAULT_TRIAL_PERIOD_DAYS = 14;
     private const OTP_GATEWAY_TENANT_CACHE_KEY = 'whatsapp_gateway.active_otp_tenant_id';
+    private const MEDIA_LIBRARY_IMAGE_OPTIMIZE_SETTING_KEY = 'media_library_image_optimize_enabled';
 
     public function superadminAiFill(Request $request): JsonResponse
     {
@@ -1619,6 +1620,9 @@ class AdminReactController extends Controller
             'light_logo_upload' => ['nullable', 'file', 'mimes:jpg,jpeg,png,gif,webp,svg', 'max:10240'],
             'panel_favicon_upload' => ['nullable', 'file', 'mimes:ico,jpg,jpeg,png,gif,webp,svg', 'max:5120'],
             'favicon_upload' => ['nullable', 'file', 'mimes:ico,jpg,jpeg,png,gif,webp,svg', 'max:5120'],
+            'panel_logo_light_media_path' => ['nullable', 'string', 'max:500'],
+            'panel_logo_dark_media_path' => ['nullable', 'string', 'max:500'],
+            'panel_favicon_media_path' => ['nullable', 'string', 'max:500'],
             'settings' => ['nullable', 'array'],
         ]);
 
@@ -1655,6 +1659,25 @@ class AdminReactController extends Controller
         }
         if ($faviconFile) {
             $pairs['panel_favicon'] = $this->storeUploadedPublicImage($faviconFile, 'assets/images/setting/favicon');
+        }
+        if (!empty($payload['panel_logo_light_media_path'])) {
+            $storedLight = $this->resolveSuperadminPanelAssetFromMediaPath((string) $payload['panel_logo_light_media_path']);
+            if ($storedLight !== null) {
+                $pairs['panel_logo_light'] = $storedLight;
+            }
+        }
+        if (!empty($payload['panel_logo_dark_media_path'])) {
+            $storedDark = $this->resolveSuperadminPanelAssetFromMediaPath((string) $payload['panel_logo_dark_media_path']);
+            if ($storedDark !== null) {
+                $pairs['panel_logo_dark'] = $storedDark;
+                $pairs['panel_logo'] = $storedDark;
+            }
+        }
+        if (!empty($payload['panel_favicon_media_path'])) {
+            $storedFavicon = $this->resolveSuperadminPanelAssetFromMediaPath((string) $payload['panel_favicon_media_path']);
+            if ($storedFavicon !== null) {
+                $pairs['panel_favicon'] = $storedFavicon;
+            }
         }
         foreach (($payload['settings'] ?? []) as $key => $value) {
             $name = trim((string) $key);
@@ -2594,7 +2617,10 @@ class AdminReactController extends Controller
         if (!$row) return response()->json(['message' => 'Role not found.'], 404);
         $row->permission = implode(',', $selected);
         $row->save();
-        return response()->json(['status' => true]);
+        return response()->json([
+            'status' => true,
+            'permission' => $selected,
+        ]);
     }
 
     /**
@@ -3897,12 +3923,17 @@ class AdminReactController extends Controller
         }
         $payload = $request->validate($rules);
 
+        $normalizedPhone = AdminContactValidation::normalizeBdPhoneForStorage($payload['phone'] ?? '');
+        $normalizedEmail = AdminContactValidation::normalizeEmail($payload['email'] ?? '');
+
         if ($isCreate) {
             $user = new User();
             $user->name = $payload['name'];
-            $user->email = (string) (time() . 'gmail.com');
+            $user->email = $normalizedEmail !== ''
+                ? $normalizedEmail
+                : (Str::slug($payload['username']) . '.' . time() . '@superstaff.local');
             $user->type = 'superstaff';
-            $user->phone = (string) time();
+            $user->phone = $normalizedPhone;
             $user->password = Hash::make($payload['password']);
             $user->save();
             $staff = new Superstaff();
@@ -3913,6 +3944,12 @@ class AdminReactController extends Controller
             $user = User::query()->find($staff->uid);
             if (!$user) return response()->json(['message' => 'Linked user not found.'], 404);
             $user->name = $payload['name'];
+            if ($normalizedEmail !== '') {
+                $user->email = $normalizedEmail;
+            }
+            if ($normalizedPhone !== '') {
+                $user->phone = $normalizedPhone;
+            }
             if (!empty($payload['password'])) {
                 $user->password = Hash::make($payload['password']);
             }
@@ -3921,8 +3958,8 @@ class AdminReactController extends Controller
 
         $staff->name = $payload['name'];
         $staff->username = $payload['username'];
-        $staff->phone = $payload['phone'];
-        $staff->email = $payload['email'] ?? null;
+        $staff->phone = $normalizedPhone !== '' ? $normalizedPhone : (string) ($payload['phone'] ?? '');
+        $staff->email = $normalizedEmail !== '' ? $normalizedEmail : ($payload['email'] ?? null);
         $staff->address = $payload['address'] ?? null;
         $staff->new_commission = $payload['new_commission'] ?? null;
         $staff->renew_commission = $payload['renew_commission'] ?? null;
@@ -4655,11 +4692,17 @@ class AdminReactController extends Controller
             ->values();
 
         $images = $imageTokens->map(function ($token, $idx) {
+            $token = (string) $token;
+            $normalizedPath = $this->normalizeStoredImageToken($token);
+
             return [
                 'id' => 'existing-' . $idx,
-                'file' => basename((string) $token),
-                'name' => basename((string) $token),
-                'url' => $this->resolveProductImageTokenPublicUrl((string) $token),
+                'file' => $token,
+                'path' => $normalizedPath !== '' && $normalizedPath !== basename($normalizedPath)
+                    ? ltrim(str_replace('\\', '/', $normalizedPath), '/')
+                    : null,
+                'name' => basename($token) ?: 'image',
+                'url' => $this->resolveProductImageTokenPublicUrl($token),
             ];
         })->filter(fn($img) => !empty($img['url']))->values();
 
@@ -6892,6 +6935,10 @@ class AdminReactController extends Controller
         $baseDir = $library['baseDir'];
         $folder = $this->sanitizeMediaFolder((string) $request->query('folder', ''));
         $dir = $this->resolveMediaLibraryFolderPath($baseDir, $folder);
+        $shouldPaginate = $request->has('page') || $request->has('per_page');
+        $page = max(1, (int) $request->query('page', 1));
+        $perPage = (int) $request->query('per_page', 24);
+        $perPage = max(12, min(96, $perPage));
         $disk = Storage::disk('public');
         $files = $folder !== ''
             ? ($disk->exists($dir) ? $disk->files($dir) : [])
@@ -6903,6 +6950,17 @@ class AdminReactController extends Controller
                 $name = basename($path);
                 return str_starts_with($name, '.') || str_starts_with($name, '._');
             })
+            ->sortByDesc(fn (string $path) => (int) $disk->lastModified($path))
+            ->values();
+
+        $total = $items->count();
+        $lastPage = $shouldPaginate ? max(1, (int) ceil($total / $perPage)) : 1;
+        if ($page > $lastPage) {
+            $page = $lastPage;
+        }
+
+        $pagedItems = $items
+            ->when($shouldPaginate, fn ($collection) => $collection->slice(($page - 1) * $perPage, $perPage))
             ->map(function (string $path) use ($disk) {
                 $name = basename($path);
                 $ext = strtolower(pathinfo($name, PATHINFO_EXTENSION));
@@ -6915,7 +6973,6 @@ class AdminReactController extends Controller
                     'is_image' => in_array($ext, ['jpg', 'jpeg', 'png', 'gif', 'webp', 'svg'], true),
                 ];
             })
-            ->sortByDesc('last_modified')
             ->values();
 
         $folderItems = collect($folders)
@@ -6930,11 +6987,44 @@ class AdminReactController extends Controller
             ->values();
 
         return response()->json([
-            'items' => $items,
+            'items' => $pagedItems,
             'folders' => $folderItems,
             'active_folder' => $folder,
             'scope' => $library['scope'],
             'base_dir' => $baseDir,
+            'image_optimize_enabled' => $this->mediaLibraryImageOptimizeEnabled(),
+            'can_manage_image_optimize' => $this->canManageMediaLibraryImageOptimize($request),
+            'upload_max_per_request' => $this->mediaLibraryUploadMaxPerRequest(),
+            'pagination' => [
+                'page' => $page,
+                'per_page' => $perPage,
+                'total' => $total,
+                'last_page' => $lastPage,
+                'has_more' => $shouldPaginate && $page < $lastPage,
+                'next_page' => $shouldPaginate && $page < $lastPage ? $page + 1 : null,
+            ],
+        ]);
+    }
+
+    public function mediaLibraryImageOptimizeUpdate(Request $request): JsonResponse
+    {
+        if (!$this->canManageMediaLibraryImageOptimize($request)) {
+            return response()->json(['message' => 'Super admin access required.'], 403);
+        }
+
+        $payload = $request->validate([
+            'enabled' => ['required', 'boolean'],
+        ]);
+
+        SuperAdminSetting::setValue(
+            self::MEDIA_LIBRARY_IMAGE_OPTIMIZE_SETTING_KEY,
+            !empty($payload['enabled']) ? '1' : '0',
+            auth()->id() ?? null
+        );
+
+        return response()->json([
+            'image_optimize_enabled' => $this->mediaLibraryImageOptimizeEnabled(),
+            'can_manage_image_optimize' => true,
         ]);
     }
 
@@ -6959,8 +7049,16 @@ class AdminReactController extends Controller
             $originalName = method_exists($file, 'getClientOriginalName')
                 ? (string) $file->getClientOriginalName()
                 : 'file';
-            $filename = $this->resolveUniqueMediaFilename($disk, $dir, $originalName);
-            $stored = $file->storeAs($dir, $filename, 'public');
+            $optimizedContents = $this->optimizedMediaLibraryImageContents($file);
+            if ($optimizedContents !== null) {
+                $optimizedName = pathinfo($this->sanitizeMediaFilename($originalName), PATHINFO_FILENAME) ?: 'image';
+                $filename = $this->resolveUniqueMediaFilename($disk, $dir, $optimizedName . '.webp');
+                $stored = trim($dir, '/') . '/' . $filename;
+                $disk->put($stored, $optimizedContents);
+            } else {
+                $filename = $this->resolveUniqueMediaFilename($disk, $dir, $originalName);
+                $stored = $file->storeAs($dir, $filename, 'public');
+            }
             $items[] = [
                 'path' => $stored,
                 'name' => basename($stored),
@@ -6972,6 +7070,76 @@ class AdminReactController extends Controller
         }
 
         return response()->json(['items' => $items], 201);
+    }
+
+    public function mediaLibraryOptimizeSelected(Request $request): JsonResponse
+    {
+        $library = $this->resolveMediaLibraryRequest($request);
+        if ($library['error']) return $library['error'];
+
+        if (!$this->canOptimizeSelectedMediaLibraryImages($request, $library['scope'])) {
+            return response()->json(['message' => 'You are not allowed to optimize selected media.'], 403);
+        }
+
+        $payload = $request->validate([
+            'paths' => ['required', 'array', 'min:1', 'max:100'],
+            'paths.*' => ['required', 'string', 'max:500'],
+        ]);
+
+        $disk = Storage::disk('public');
+        $baseDir = trim((string) $library['baseDir'], '/');
+        $optimized = [];
+        $skipped = [];
+
+        foreach ($payload['paths'] as $rawPath) {
+            $path = $this->normalizeMediaLibraryDiskPath((string) $rawPath);
+            $prefix = $baseDir . '/';
+            if ($path === '' || (!str_starts_with($path, $prefix) && $path !== $baseDir)) {
+                $skipped[] = ['path' => $rawPath, 'reason' => 'Invalid media path.'];
+                continue;
+            }
+            if (!$disk->exists($path)) {
+                $skipped[] = ['path' => $path, 'reason' => 'File not found.'];
+                continue;
+            }
+
+            $optimizedContents = $this->optimizedMediaLibraryStoredImageContents($disk, $path);
+            if ($optimizedContents === null) {
+                $skipped[] = ['path' => $path, 'reason' => 'Unsupported image type.'];
+                continue;
+            }
+
+            $dir = trim(dirname($path), '. /');
+            $originalName = basename($path);
+            $baseName = pathinfo($this->sanitizeMediaFilename($originalName), PATHINFO_FILENAME) ?: 'image';
+            $sameWebpPath = strtolower(pathinfo($path, PATHINFO_EXTENSION)) === 'webp';
+            $targetPath = $sameWebpPath
+                ? $path
+                : $this->uniqueMediaLibraryOptimizedPath($disk, $dir, $baseName . '.webp');
+
+            $disk->put($targetPath, $optimizedContents);
+            if ($targetPath !== $path && $disk->exists($path)) {
+                $disk->delete($path);
+            }
+
+            $optimized[] = [
+                'old_path' => $path,
+                'path' => $targetPath,
+                'name' => basename($targetPath),
+                'url' => $this->mediaLibraryFileUrl($targetPath, $this->mediaStoreIdFromPath($targetPath)),
+                'size' => (int) $disk->size($targetPath),
+                'last_modified' => (int) $disk->lastModified($targetPath),
+                'is_image' => true,
+            ];
+        }
+
+        return response()->json([
+            'success' => true,
+            'optimized_count' => count($optimized),
+            'skipped_count' => count($skipped),
+            'items' => $optimized,
+            'skipped' => $skipped,
+        ]);
     }
 
     public function mediaLibraryCreateFolder(Request $request): JsonResponse
@@ -7093,7 +7261,9 @@ class AdminReactController extends Controller
 
     public function publicMediaLibraryFile(Request $request)
     {
-        $path = $this->normalizeMediaLibraryDiskPath((string) $request->query('path', ''));
+        $path = $this->normalizePublicMediaLibraryPath(
+            $this->normalizeMediaLibraryDiskPath((string) $request->query('path', ''))
+        );
         if ($path === '') {
             return response()->json(['message' => 'Missing file path.'], 422);
         }
@@ -7137,6 +7307,7 @@ class AdminReactController extends Controller
 
     private function publicMediaLibrarySource(string $path): ?array
     {
+        $path = $this->normalizePublicMediaLibraryPath($path);
         $disk = Storage::disk('public');
         if ($disk->exists($path)) {
             return [
@@ -7145,7 +7316,14 @@ class AdminReactController extends Controller
             ];
         }
 
-        foreach ([public_path('storage/' . $path), public_path($path), storage_path('app/public/' . $path)] as $candidate) {
+        if ($resolvedDiskPath = $this->resolvePublicDiskPathCaseInsensitive($path)) {
+            return [
+                'mime' => mime_content_type($resolvedDiskPath) ?: null,
+                'stream' => fopen($resolvedDiskPath, 'rb'),
+            ];
+        }
+
+        foreach ($this->publicMediaLibraryFallbackCandidates($path) as $candidate) {
             if (!is_file($candidate)) {
                 continue;
             }
@@ -7157,6 +7335,146 @@ class AdminReactController extends Controller
         }
 
         return null;
+    }
+
+    private function publicMediaLibraryFallbackCandidates(string $path): array
+    {
+        $path = $this->normalizePublicMediaLibraryPath($path);
+        $basename = basename($path);
+        $candidates = [
+            public_path('storage/' . $path),
+            public_path($path),
+            storage_path('app/public/' . $path),
+        ];
+
+        $segments = explode('/', $path);
+        if (($segments[0] ?? '') === 'image-library' && ($segments[1] ?? '') === 'superadmin') {
+            $folder = (string) ($segments[2] ?? '');
+            $folderVariants = array_values(array_unique(array_filter([
+                $folder,
+                strtolower($folder),
+                strtoupper($folder),
+                ucfirst(strtolower($folder)),
+                Str::plural(strtolower($folder)),
+                Str::singular(strtolower($folder)),
+            ])));
+
+            foreach ($folderVariants as $variant) {
+                $candidates[] = storage_path('app/public/image-library/superadmin/' . $variant . '/' . $basename);
+                $candidates[] = public_path('storage/image-library/superadmin/' . $variant . '/' . $basename);
+                $candidates[] = public_path('assets/images/' . $variant . '/' . $basename);
+            }
+        }
+
+        foreach ($this->findPublicMediaByBasename($path) as $candidate) {
+            $candidates[] = $candidate;
+        }
+
+        return array_values(array_unique($candidates));
+    }
+
+    private function resolvePublicDiskPathCaseInsensitive(string $path): ?string
+    {
+        $path = $this->normalizePublicMediaLibraryPath($path);
+        if ($path === '' || str_contains($path, '..')) {
+            return null;
+        }
+
+        $current = storage_path('app/public');
+        foreach (explode('/', $path) as $segment) {
+            if ($segment === '') {
+                continue;
+            }
+
+            $candidate = $current . DIRECTORY_SEPARATOR . $segment;
+            if (file_exists($candidate)) {
+                $current = $candidate;
+                continue;
+            }
+
+            if (!is_dir($current)) {
+                return null;
+            }
+
+            $match = null;
+            foreach (scandir($current) ?: [] as $entry) {
+                if ($entry === '.' || $entry === '..') {
+                    continue;
+                }
+                if (strcasecmp($entry, $segment) === 0) {
+                    $match = $entry;
+                    break;
+                }
+            }
+
+            if ($match === null) {
+                return null;
+            }
+
+            $current .= DIRECTORY_SEPARATOR . $match;
+        }
+
+        return is_file($current) ? $current : null;
+    }
+
+    private function findPublicMediaByBasename(string $path): array
+    {
+        $path = $this->normalizePublicMediaLibraryPath($path);
+        $basename = basename($path);
+        if ($basename === '' || str_contains($basename, '..')) {
+            return [];
+        }
+
+        $roots = [];
+        if (Str::startsWith($path, 'image-library/superadmin/')) {
+            $roots[] = storage_path('app/public/image-library/superadmin');
+            $roots[] = public_path('assets/images');
+        } elseif (Str::startsWith($path, 'image-library/admin/')) {
+            $segments = explode('/', $path);
+            $storeSegment = (string) ($segments[2] ?? '');
+            if ($storeSegment !== '') {
+                $roots[] = storage_path('app/public/image-library/admin/' . $storeSegment);
+            }
+        } elseif (Str::startsWith($path, 'ai-seed-library/')) {
+            $roots[] = storage_path('app/public/ai-seed-library');
+        }
+
+        $matches = [];
+        foreach ($roots as $root) {
+            if (!is_dir($root)) {
+                continue;
+            }
+
+            $iterator = new \RecursiveIteratorIterator(
+                new \RecursiveDirectoryIterator($root, \FilesystemIterator::SKIP_DOTS)
+            );
+            foreach ($iterator as $file) {
+                if (!$file->isFile()) {
+                    continue;
+                }
+                if (strcasecmp($file->getBasename(), $basename) === 0) {
+                    $matches[] = $file->getPathname();
+                    if (count($matches) >= 5) {
+                        break 2;
+                    }
+                }
+            }
+        }
+
+        return $matches;
+    }
+
+    private function normalizePublicMediaLibraryPath(string $path): string
+    {
+        $clean = trim(str_replace('\\', '/', $path), '/');
+
+        foreach (['public/storage/', 'storage/app/public/', 'app/public/', 'storage/'] as $prefix) {
+            if (Str::startsWith($clean, $prefix)) {
+                $clean = Str::after($clean, $prefix);
+            }
+        }
+
+        return $clean;
     }
 
     public function catalogVariantUpdate(Request $request, string $type, int $id): JsonResponse
@@ -7257,17 +7575,17 @@ class AdminReactController extends Controller
 
     private function resolveMediaLibraryRequest(Request $request): array
     {
-        $scope = strtolower(trim((string) $request->query('scope', 'admin')));
-        if (!in_array($scope, ['admin', 'superadmin'], true)) {
-            $scope = 'admin';
-        }
-
         $user = $request->user();
         if (!$user) {
             return ['error' => response()->json(['message' => 'Unauthenticated.'], 401)];
         }
 
         $userType = strtolower((string) ($user->type ?? ''));
+        $scope = strtolower(trim((string) $request->query('scope', '')));
+        if (!in_array($scope, ['admin', 'superadmin'], true)) {
+            $scope = in_array($userType, ['superadmin', 'superstaff'], true) ? 'superadmin' : 'admin';
+        }
+
         if ($scope === 'superadmin') {
             if (!in_array($userType, ['superadmin', 'superstaff'], true)) {
                 return ['error' => response()->json(['message' => 'Super admin media access required.'], 403)];
@@ -7380,7 +7698,7 @@ class AdminReactController extends Controller
         $extension = pathinfo($filename, PATHINFO_EXTENSION);
         $basename = pathinfo($filename, PATHINFO_FILENAME);
         $candidate = $filename;
-        $counter = 2;
+        $counter = 1;
 
         while ($disk->exists(trim($dir, '/') . '/' . $candidate)) {
             $suffix = '-' . $counter;
@@ -7402,7 +7720,7 @@ class AdminReactController extends Controller
         $extension = pathinfo($filename, PATHINFO_EXTENSION);
         $basename = pathinfo($filename, PATHINFO_FILENAME);
         $candidate = $filename;
-        $counter = 2;
+        $counter = 1;
 
         while (file_exists(rtrim($absoluteDir, DIRECTORY_SEPARATOR) . DIRECTORY_SEPARATOR . $candidate)) {
             $suffix = '-' . $counter;
@@ -7415,16 +7733,126 @@ class AdminReactController extends Controller
         return $candidate;
     }
 
+    private function mediaLibraryImageOptimizeEnabled(): bool
+    {
+        $value = strtolower(trim((string) SuperAdminSetting::getValue(
+            self::MEDIA_LIBRARY_IMAGE_OPTIMIZE_SETTING_KEY,
+            '1'
+        )));
+
+        return in_array($value, ['1', 'true', 'yes', 'on'], true);
+    }
+
+    private function canManageMediaLibraryImageOptimize(Request $request): bool
+    {
+        $user = $request->user();
+        if (!$user) {
+            return false;
+        }
+
+        return in_array(strtolower((string) ($user->type ?? '')), ['superadmin', 'superstaff'], true);
+    }
+
+    private function mediaLibraryUploadMaxPerRequest(): int
+    {
+        $max = (int) ini_get('max_file_uploads');
+
+        return $max > 0 ? $max : 20;
+    }
+
+    private function canOptimizeSelectedMediaLibraryImages(Request $request, string $scope): bool
+    {
+        $user = $request->user();
+        if (!$user) {
+            return false;
+        }
+
+        $userType = strtolower((string) ($user->type ?? ''));
+        if ($scope === 'superadmin') {
+            return in_array($userType, ['superadmin', 'superstaff'], true);
+        }
+
+        if (in_array($userType, ['superadmin', 'superstaff'], true)) {
+            return true;
+        }
+
+        return true;
+    }
+
+    private function optimizedMediaLibraryImageContents($file): ?string
+    {
+        if (!$this->mediaLibraryImageOptimizeEnabled()) {
+            return null;
+        }
+
+        $extension = strtolower((string) ($file->getClientOriginalExtension() ?: pathinfo($file->getClientOriginalName(), PATHINFO_EXTENSION)));
+        if (in_array($extension, ['svg', 'gif', 'ico'], true)) {
+            return null;
+        }
+
+        try {
+            $image = \Intervention\Image\Facades\Image::make($file->getRealPath())->orientate();
+            $maxSide = 1920;
+            if ($image->width() > $maxSide || $image->height() > $maxSide) {
+                $image->resize($maxSide, $maxSide, function ($constraint) {
+                    $constraint->aspectRatio();
+                    $constraint->upsize();
+                });
+            }
+
+            return (string) $image->encode('webp', 82);
+        } catch (\Throwable $exception) {
+            Log::warning('Media library image optimization failed; falling back to original upload.', [
+                'file' => method_exists($file, 'getClientOriginalName') ? $file->getClientOriginalName() : null,
+                'error' => $exception->getMessage(),
+            ]);
+
+            return null;
+        }
+    }
+
+    private function optimizedMediaLibraryStoredImageContents($disk, string $path): ?string
+    {
+        $extension = strtolower(pathinfo($path, PATHINFO_EXTENSION));
+        if (!in_array($extension, ['jpg', 'jpeg', 'png', 'webp', 'bmp'], true)) {
+            return null;
+        }
+
+        try {
+            $source = method_exists($disk, 'path') ? $disk->path($path) : $disk->get($path);
+            $image = \Intervention\Image\Facades\Image::make($source)->orientate();
+            $maxSide = 1920;
+            if ($image->width() > $maxSide || $image->height() > $maxSide) {
+                $image->resize($maxSide, $maxSide, function ($constraint) {
+                    $constraint->aspectRatio();
+                    $constraint->upsize();
+                });
+            }
+
+            return (string) $image->encode('webp', 82);
+        } catch (\Throwable $exception) {
+            Log::warning('Selected media optimization failed.', [
+                'path' => $path,
+                'error' => $exception->getMessage(),
+            ]);
+
+            return null;
+        }
+    }
+
+    private function uniqueMediaLibraryOptimizedPath($disk, string $dir, string $filename): string
+    {
+        $dir = trim($dir, '/');
+        $filename = $this->resolveUniqueMediaFilename($disk, $dir, $filename);
+
+        return ($dir !== '' ? $dir . '/' : '') . $filename;
+    }
+
     private function mediaLibraryFileUrl(string $path, ?string $storeId = null): string
     {
         $cleanPath = $this->normalizeMediaLibraryDiskPath($path);
-        $params = ['path' => $cleanPath];
 
-        if (Str::startsWith($cleanPath, ['image-library/superadmin/', 'ai-seed-library/'])) {
-            $params['scope'] = 'superadmin';
-        }
-
-        return rtrim($this->assetOrigin(), '/') . '/react-admin-api/public/media-library/file?' . http_build_query($params);
+        return rtrim($this->assetOrigin(), '/') . '/react-admin-api/public/media-library/file?' . http_build_query(['path' => $cleanPath]);
     }
 
     private function mediaStoreIdFromPath(string $path): ?string
@@ -11176,7 +11604,53 @@ class AdminReactController extends Controller
             'phone' => $user->phone,
             'type' => $user->type,
             'store_id' => $user->store_id,
+            'superadmin_permissions' => $this->resolveSuperadminPermissionsForUser($user),
         ];
+    }
+
+    /**
+     * Permission keys for superadmin panel nav (superstaff role + optional superstaff_permissions row).
+     *
+     * @return list<string>
+     */
+    private function resolveSuperadminPermissionsForUser(User $user): array
+    {
+        $type = strtolower((string) ($user->type ?? ''));
+        if ($type === 'superadmin') {
+            return ['*'];
+        }
+
+        if ($type !== 'superstaff') {
+            return [];
+        }
+
+        $staff = Superstaff::query()->where('uid', $user->id)->first();
+        if (!$staff || !(int) ($staff->role_id ?? 0)) {
+            return [];
+        }
+
+        $permissions = [];
+        $role = Superrole::query()->find((int) $staff->role_id);
+        if ($role) {
+            $permissions = array_merge(
+                $permissions,
+                array_values(array_filter(array_map('trim', explode(',', (string) ($role->permission ?? '')))))
+            );
+        }
+
+        if (Schema::hasTable('superstaff_permissions')) {
+            $override = DB::table('superstaff_permissions')
+                ->where('role_id', (int) $staff->role_id)
+                ->first();
+            if ($override && trim((string) ($override->permission ?? '')) !== '') {
+                $permissions = array_merge(
+                    array_values(array_filter(array_map('trim', explode(',', (string) $override->permission)))),
+                    $permissions
+                );
+            }
+        }
+
+        return array_values(array_unique(array_filter($permissions)));
     }
 
     /**
@@ -11257,8 +11731,16 @@ class AdminReactController extends Controller
         $logo = str_replace('\\', '/', $logo);
         $logo = ltrim($logo, '/');
 
-        // Paths written from media library or other flows (same rules as resolveSettingAssetPublicUrl).
-        if (Str::startsWith($logo, ['storage/', 'assets/', 'image-library/'])) {
+        if (Str::startsWith($logo, 'storage/image-library/') || Str::startsWith($logo, 'storage/ai-seed-library/')) {
+            return $this->mediaLibraryFileUrl(Str::after($logo, 'storage/'), $this->mediaStoreIdFromPath($logo));
+        }
+
+        if (Str::startsWith($logo, ['image-library/', 'ai-seed-library/'])) {
+            return $this->mediaLibraryFileUrl($logo, $this->mediaStoreIdFromPath($logo));
+        }
+
+        // Paths written from public assets or normal storage flows.
+        if (Str::startsWith($logo, ['storage/', 'assets/'])) {
             return rtrim($this->assetOrigin(), '/') . '/' . $logo;
         }
 
@@ -11305,50 +11787,12 @@ class AdminReactController extends Controller
             return null;
         }
 
-        if (Str::startsWith($first, ['http://', 'https://'])) {
-            return $first;
-        }
-
-        $first = ltrim(str_replace('\\', '/', $first), '/');
-        $origin = $this->assetOrigin();
-
-        if (Str::startsWith($first, 'storage/image-library/') || Str::startsWith($first, 'storage/ai-seed-library/')) {
-            return $this->mediaLibraryFileUrl(Str::after($first, 'storage/'), $this->mediaStoreIdFromPath($first));
-        }
-        if (Str::startsWith($first, 'storage/')) {
-            return $origin . '/' . $first;
-        }
-        if (Str::startsWith($first, ['react-admin-media/', 'image-library/', 'ai-seed-library/'])) {
-            return $this->mediaLibraryFileUrl($first, $this->mediaStoreIdFromPath($first));
-        }
-
-        return $origin . '/assets/images/product/' . $first;
+        return $this->resolveProductImageTokenPublicUrl($first);
     }
 
     private function resolveProductImageTokenPublicUrl(string $token): ?string
     {
-        $clean = trim((string) $token);
-        if ($clean === '' || str_contains($clean, '..')) {
-            return null;
-        }
-        if (Str::startsWith($clean, ['http://', 'https://'])) {
-            return $clean;
-        }
-        $clean = ltrim(str_replace('\\', '/', $clean), '/');
-        $origin = $this->assetOrigin();
-        if (Str::startsWith($clean, 'storage/image-library/') || Str::startsWith($clean, 'storage/ai-seed-library/')) {
-            return $this->mediaLibraryFileUrl(Str::after($clean, 'storage/'), $this->mediaStoreIdFromPath($clean));
-        }
-        if (Str::startsWith($clean, 'storage/')) {
-            return $origin . '/' . $clean;
-        }
-        if (Str::startsWith($clean, ['react-admin-media/', 'image-library/', 'ai-seed-library/'])) {
-            return $this->mediaLibraryFileUrl($clean, $this->mediaStoreIdFromPath($clean));
-        }
-        if (Str::startsWith($clean, 'assets/')) {
-            return $origin . '/' . $clean;
-        }
-        return $origin . '/assets/images/product/' . $clean;
+        return $this->resolveCatalogAssetPublicUrl($token, 'assets/images/product');
     }
 
     /**
@@ -11400,23 +11844,26 @@ class AdminReactController extends Controller
         }
 
         if (Str::startsWith($value, ['http://', 'https://'])) {
-            return $value;
+            return $this->resolveAbsoluteAssetPublicUrl($value);
         }
 
-        $path = ltrim(str_replace('\\', '/', $value), '/');
-        $origin = $this->assetOrigin();
+        $folderMap = [
+            'design' => 'themes',
+            'template' => 'templates',
+            'product' => 'products',
+            'category' => 'categories',
+            'brand' => 'brands',
+            'icon' => 'icons',
+            'banner' => 'banners',
+            'slider' => 'sliders',
+            'testimonials' => 'testimonials',
+        ];
+        $legacyKey = trim(str_replace('\\', '/', Str::after($defaultBasePath, 'assets/images/')), '/');
+        $libraryFolder = $folderMap[$legacyKey] ?? $legacyKey;
 
-        if (Str::startsWith($path, 'storage/image-library/') || Str::startsWith($path, 'storage/ai-seed-library/')) {
-            return $this->mediaLibraryFileUrl(Str::after($path, 'storage/'), $this->mediaStoreIdFromPath($path));
-        }
-        if (Str::startsWith($path, ['image-library/', 'ai-seed-library/'])) {
-            return $this->mediaLibraryFileUrl($path, $this->mediaStoreIdFromPath($path));
-        }
-        if (Str::startsWith($path, ['storage/', 'assets/'])) {
-            return $origin . '/' . $path;
-        }
-
-        return $origin . '/' . trim($defaultBasePath, '/') . '/' . $path;
+        return $this->publicUrlForLocatedAsset(
+            $this->locateStoredPublicAsset($value, $defaultBasePath, $libraryFolder !== '' ? $libraryFolder : null)
+        );
     }
 
     private function normalizeShippingMethods($input): array
@@ -11478,54 +11925,350 @@ class AdminReactController extends Controller
         }
 
         if (Str::startsWith($value, ['http://', 'https://'])) {
-            return $value;
+            $resolved = $this->resolveAbsoluteAssetPublicUrl($value);
+            if ($resolved !== $value) {
+                return $resolved;
+            }
+            $path = ltrim(str_replace('\\', '/', (string) (parse_url($value, PHP_URL_PATH) ?: '')), '/');
+            if (Str::startsWith($path, 'assets/images/setting')) {
+                $legacyDir = str_contains($path, '/favicon/') ? 'assets/images/setting/favicon' : 'assets/images/setting';
+                $folder = str_contains($path, '/favicon/') ? 'settings/favicons' : 'settings';
+                return $this->publicUrlForLocatedAsset(
+                    $this->locateStoredPublicAsset(basename($path), $legacyDir, $folder)
+                );
+            }
+
+            return $resolved;
         }
 
-        $path = ltrim(str_replace('\\', '/', $value), '/');
-        $origin = $this->assetOrigin();
-
-        if (Str::startsWith($path, 'storage/image-library/') || Str::startsWith($path, 'storage/ai-seed-library/')) {
-            return publicMediaLibraryUrl(Str::after($path, 'storage/'));
-        }
-
-        if (Str::startsWith($path, ['storage/', 'assets/'])) {
-            return $origin . '/' . $path;
-        }
-
-        if (Str::startsWith($path, ['image-library/', 'ai-seed-library/'])) {
-            return publicMediaLibraryUrl($path);
-        }
-
-        $storagePath = 'setting/' . $path;
-        if (Storage::disk('public')->exists($storagePath)) {
-            return $origin . '/storage/' . $storagePath;
-        }
-
-        $libraryBase = trim(str_replace('\\', '/', Str::after($defaultBasePath, 'assets/images/')), '/');
-        $libraryFolder = match ($libraryBase) {
+        $libraryFolder = match (trim(str_replace('\\', '/', Str::after($defaultBasePath, 'assets/images/')), '/')) {
             'setting/favicon' => 'settings/favicons',
             'setting' => 'settings',
-            default => $libraryBase,
+            default => null,
         };
-        if ($libraryFolder !== '') {
-            $libraryPath = 'image-library/superadmin/' . $libraryFolder . '/' . basename($path);
-            if (Storage::disk('public')->exists($libraryPath)) {
-                return publicMediaLibraryUrl($libraryPath);
+
+        return $this->publicUrlForLocatedAsset(
+            $this->locateStoredPublicAsset($value, $defaultBasePath, $libraryFolder)
+        );
+    }
+
+    /**
+     * Serve /assets/images/setting/* when the file is stored on the public disk or legacy folders.
+     */
+    public function serveLegacyPanelBrandAsset(Request $request, string $filename)
+    {
+        if ($filename === '' || str_contains($filename, '..')) {
+            abort(404);
+        }
+
+        $legacyDir = str_contains($request->path(), '/favicon/')
+            ? 'assets/images/setting/favicon'
+            : 'assets/images/setting';
+        $libraryFolder = $legacyDir === 'assets/images/setting/favicon' ? 'settings/favicons' : 'settings';
+        $located = $this->locateStoredPublicAsset($filename, $legacyDir, $libraryFolder);
+
+        return $this->streamLocatedAssetResponse($located);
+    }
+
+    /**
+     * Serve /assets/images/design/* (and similar legacy catalog asset paths).
+     */
+    public function serveLegacyCatalogAsset(Request $request, string $filename, string $catalog = 'design')
+    {
+        if ($filename === '' || str_contains($filename, '..')) {
+            abort(404);
+        }
+
+        $legacyDir = 'assets/images/' . trim($catalog, '/');
+        $folderMap = [
+            'design' => 'themes',
+            'template' => 'templates',
+            'product' => 'products',
+            'category' => 'categories',
+            'brand' => 'brands',
+            'icon' => 'icons',
+        ];
+        $libraryFolder = $folderMap[$catalog] ?? $catalog;
+        $located = $this->locateStoredPublicAsset($filename, $legacyDir, $libraryFolder);
+
+        return $this->streamLocatedAssetResponse($located);
+    }
+
+    /**
+     * @return array{disk_path?:string, public_path?:string}|null
+     */
+    private function locateStoredPublicAsset(string $storedValue, string $legacyPublicDirectory, ?string $mediaLibraryFolder = null): ?array
+    {
+        $normalized = $this->normalizePublicMediaLibraryPath(ltrim(str_replace('\\', '/', trim($storedValue)), '/'));
+        if ($normalized === '' || str_contains($normalized, '..')) {
+            return null;
+        }
+
+        $disk = Storage::disk('public');
+
+        if (Str::startsWith($normalized, ['image-library/', 'ai-seed-library/', 'react-admin-media/'])) {
+            return $disk->exists($normalized) ? ['disk_path' => $normalized] : null;
+        }
+
+        if (Str::startsWith($normalized, 'storage/')) {
+            $withoutStorage = Str::after($normalized, 'storage/');
+            if ($disk->exists($withoutStorage)) {
+                return ['disk_path' => $withoutStorage];
             }
         }
 
-        return $origin . '/' . trim($defaultBasePath, '/') . '/' . basename($path);
+        if (Str::startsWith($normalized, 'assets/')) {
+            $publicFile = public_path($normalized);
+            if (is_file($publicFile)) {
+                return ['public_path' => $publicFile];
+            }
+        }
+
+        $basename = basename($normalized);
+        if ($basename === '') {
+            return null;
+        }
+
+        $legacyFile = public_path(trim($legacyPublicDirectory, '/') . '/' . $basename);
+        if (is_file($legacyFile)) {
+            return ['public_path' => $legacyFile];
+        }
+
+        foreach (['setting/' . $basename, 'setting/favicon/' . $basename] as $legacyStoragePath) {
+            if ($disk->exists($legacyStoragePath)) {
+                return ['disk_path' => $legacyStoragePath];
+            }
+        }
+
+        if ($mediaLibraryFolder !== null && $mediaLibraryFolder !== '') {
+            $candidates = [
+                'image-library/superadmin/' . trim($mediaLibraryFolder, '/') . '/' . $basename,
+                'image-library/superadmin/' . Str::singular(trim($mediaLibraryFolder, '/')) . '/' . $basename,
+                'image-library/superadmin/' . Str::plural(trim($mediaLibraryFolder, '/')) . '/' . $basename,
+            ];
+            foreach (array_unique($candidates) as $candidate) {
+                if ($disk->exists($candidate)) {
+                    return ['disk_path' => $candidate];
+                }
+            }
+
+            $ctx = $this->resolveReactStoreContext(request());
+            if (empty($ctx['error']) && !empty($ctx['store']) && !empty($ctx['customer'])) {
+                $adminBase = trim(
+                    $this->adminMediaLibraryDirectory($ctx['store'], $ctx['customer'], $mediaLibraryFolder),
+                    '/',
+                );
+                $adminCandidate = $adminBase . '/' . $basename;
+                if ($disk->exists($adminCandidate)) {
+                    return ['disk_path' => $adminCandidate];
+                }
+
+                foreach ($this->findPublicMediaByBasename($adminBase . '/' . $basename) as $absolute) {
+                    $relative = $this->absolutePathToPublicDiskRelative($absolute);
+                    if ($relative !== null) {
+                        return ['disk_path' => $relative];
+                    }
+                    if (is_file($absolute)) {
+                        return ['public_path' => $absolute];
+                    }
+                }
+            }
+        }
+
+        $searchSeed = $mediaLibraryFolder !== null && $mediaLibraryFolder !== ''
+            ? 'image-library/superadmin/' . trim($mediaLibraryFolder, '/') . '/' . $basename
+            : $normalized;
+
+        foreach ($this->findPublicMediaByBasename($searchSeed) as $absolute) {
+            $relative = $this->absolutePathToPublicDiskRelative($absolute);
+            if ($relative !== null) {
+                return ['disk_path' => $relative];
+            }
+            if (is_file($absolute)) {
+                return ['public_path' => $absolute];
+            }
+        }
+
+        return null;
+    }
+
+    private function absolutePathToPublicDiskRelative(string $absolute): ?string
+    {
+        $resolved = realpath($absolute);
+        if ($resolved === false) {
+            return null;
+        }
+
+        $storageRoot = realpath(storage_path('app/public'));
+        if ($storageRoot && str_starts_with($resolved, $storageRoot)) {
+            return ltrim(str_replace('\\', '/', Str::after($resolved, $storageRoot)), '/');
+        }
+
+        $webRoot = realpath(public_path());
+        if ($webRoot && str_starts_with($resolved, $webRoot)) {
+            return ltrim(str_replace('\\', '/', Str::after($resolved, $webRoot)), '/');
+        }
+
+        return null;
+    }
+
+    /**
+     * @param array{disk_path?:string, public_path?:string}|null $located
+     */
+    private function publicUrlForLocatedAsset(?array $located): ?string
+    {
+        if (!$located) {
+            return null;
+        }
+
+        if (!empty($located['disk_path'])) {
+            $path = $located['disk_path'];
+            if (Str::startsWith($path, ['image-library/', 'ai-seed-library/', 'react-admin-media/'])) {
+                return publicMediaLibraryUrl($path);
+            }
+
+            return rtrim($this->assetOrigin(), '/') . '/storage/' . ltrim($path, '/');
+        }
+
+        if (!empty($located['public_path']) && is_file($located['public_path'])) {
+            $relative = $this->absolutePathToPublicDiskRelative($located['public_path']);
+            if ($relative !== null && Str::startsWith($relative, ['image-library/', 'ai-seed-library/', 'react-admin-media/'])) {
+                return publicMediaLibraryUrl($relative);
+            }
+            if ($relative !== null) {
+                return rtrim($this->assetOrigin(), '/') . '/' . ltrim($relative, '/');
+            }
+        }
+
+        return null;
+    }
+
+    /**
+     * @param array{disk_path?:string, public_path?:string}|null $located
+     */
+    private function streamLocatedAssetResponse(?array $located)
+    {
+        if (!$located) {
+            abort(404);
+        }
+
+        if (!empty($located['public_path']) && is_file($located['public_path'])) {
+            $mime = mime_content_type($located['public_path']) ?: 'application/octet-stream';
+
+            return response()->file($located['public_path'], [
+                'Content-Type' => $mime,
+                'Cache-Control' => 'public, max-age=31536000, immutable',
+            ]);
+        }
+
+        if (!empty($located['disk_path'])) {
+            $disk = Storage::disk('public');
+            $path = $located['disk_path'];
+            if (!$disk->exists($path)) {
+                abort(404);
+            }
+
+            $mime = $disk->mimeType($path) ?: 'application/octet-stream';
+            $stream = $disk->readStream($path);
+            if (!$stream) {
+                abort(500);
+            }
+
+            return Response::stream(function () use ($stream) {
+                fpassthru($stream);
+                if (is_resource($stream)) {
+                    fclose($stream);
+                }
+            }, 200, [
+                'Content-Type' => $mime,
+                'Cache-Control' => 'public, max-age=31536000, immutable',
+            ]);
+        }
+
+        abort(404);
     }
 
     private function assetOrigin(): string
     {
-        $requestOrigin = request()->getSchemeAndHttpHost();
-        if ($requestOrigin !== '') {
-            return rtrim($requestOrigin, '/');
+        $assetUrl = trim((string) config('app.asset_url'));
+        if ($assetUrl !== '') {
+            return rtrim($assetUrl, '/');
         }
 
         $configuredAppUrl = trim((string) config('app.url'));
-        return rtrim($configuredAppUrl !== '' ? $configuredAppUrl : '', '/');
+        if ($configuredAppUrl !== '') {
+            return rtrim($configuredAppUrl, '/');
+        }
+
+        $requestOrigin = request()->getSchemeAndHttpHost();
+        return $requestOrigin !== '' ? rtrim($requestOrigin, '/') : '';
+    }
+
+    private function resolveAbsoluteAssetPublicUrl(string $value): string
+    {
+        if (str_contains($value, 'media-library/file?')) {
+            $query = parse_url($value, PHP_URL_QUERY);
+            if (is_string($query) && $query !== '') {
+                parse_str($query, $params);
+                $mediaPath = trim((string) ($params['path'] ?? ''));
+                if ($mediaPath !== '' && !str_contains($mediaPath, '..')) {
+                    return publicMediaLibraryUrl($this->normalizePublicMediaLibraryPath($mediaPath));
+                }
+            }
+        }
+
+        $path = ltrim(str_replace('\\', '/', (string) (parse_url($value, PHP_URL_PATH) ?: '')), '/');
+        $origin = $this->assetOrigin();
+
+        if (Str::startsWith($path, 'storage/image-library/') || Str::startsWith($path, 'storage/ai-seed-library/')) {
+            return $this->mediaLibraryFileUrl(Str::after($path, 'storage/'), $this->mediaStoreIdFromPath($path));
+        }
+        if (Str::startsWith($path, ['image-library/', 'ai-seed-library/'])) {
+            return $this->mediaLibraryFileUrl($path, $this->mediaStoreIdFromPath($path));
+        }
+        if (Str::startsWith($path, 'assets/images/setting')) {
+            $legacyDir = str_contains($path, '/favicon/') ? 'assets/images/setting/favicon' : 'assets/images/setting';
+            $folder = str_contains($path, '/favicon/') ? 'settings/favicons' : 'settings';
+            $resolved = $this->publicUrlForLocatedAsset(
+                $this->locateStoredPublicAsset(basename($path), $legacyDir, $folder)
+            );
+            if ($resolved !== null) {
+                return $resolved;
+            }
+        }
+
+        if (Str::startsWith($path, 'assets/images/')) {
+            $legacyKey = trim(Str::after($path, 'assets/images/'), '/');
+            $legacyKey = explode('/', $legacyKey)[0] ?? '';
+            $legacyDir = 'assets/images/' . $legacyKey;
+            $folderMap = [
+                'design' => 'themes',
+                'template' => 'templates',
+                'product' => 'products',
+            ];
+            $resolved = $this->publicUrlForLocatedAsset(
+                $this->locateStoredPublicAsset(
+                    basename($path),
+                    $legacyDir,
+                    $folderMap[$legacyKey] ?? $legacyKey
+                )
+            );
+            if ($resolved !== null) {
+                return $resolved;
+            }
+        }
+
+        if (Str::startsWith($path, ['storage/', 'assets/'])) {
+            $located = $this->locateStoredPublicAsset($path, $path, null);
+            $resolved = $this->publicUrlForLocatedAsset($located);
+            if ($resolved !== null) {
+                return $resolved;
+            }
+
+            return $origin . '/' . $path;
+        }
+
+        return $value;
     }
 
     private function extractAddonText($value): string
@@ -11631,6 +12374,24 @@ class AdminReactController extends Controller
         return $origin . '/assets/images/addons/' . basename($clean);
     }
 
+    private function resolveSuperadminPanelAssetFromMediaPath(string $path): ?string
+    {
+        $cleanPath = $this->normalizeMediaLibraryDiskPath($path);
+        if ($cleanPath === '' || str_contains($cleanPath, '..')) {
+            return null;
+        }
+        if (!Str::startsWith($cleanPath, ['image-library/superadmin/', 'ai-seed-library/'])) {
+            return null;
+        }
+
+        $disk = Storage::disk('public');
+        if (!$disk->exists($cleanPath)) {
+            return null;
+        }
+
+        return 'storage/' . $cleanPath;
+    }
+
     private function copyMediaLibraryAssetToProductDirectory(string $path, string $customerId, string $storeId): ?string
     {
         $cleanPath = $this->normalizeMediaLibraryDiskPath($path);
@@ -11693,15 +12454,13 @@ class AdminReactController extends Controller
         }
 
         if (in_array($normalizedDirectory, ['assets/images/setting', 'assets/images/setting/favicon'], true)) {
-            $targetDir = public_path($normalizedDirectory);
-            if (!is_dir($targetDir)) {
-                @mkdir($targetDir, 0755, true);
-            }
+            $folder = $normalizedDirectory === 'assets/images/setting/favicon' ? 'settings/favicons' : 'settings';
+            $libraryDir = $this->superAdminMediaLibraryDirectory($folder);
+            $disk = Storage::disk('public');
+            $filename = $this->resolveUniqueMediaFilename($disk, $libraryDir, $originalLogical);
+            $stored = $file->storeAs($libraryDir, $filename, 'public');
 
-            $filename = $this->resolveUniquePublicDiskFilename($targetDir, $originalLogical);
-            $file->move($targetDir, $filename);
-
-            return $filename;
+            return 'storage/' . ltrim((string) $stored, '/');
         }
 
         $libraryDir = $this->mediaLibraryDirectoryForLegacyPublicDirectory($directory);

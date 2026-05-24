@@ -26,6 +26,8 @@ use Throwable;
 
 class AiStoreSeedService
 {
+    private array $usedSeedImageIds = [];
+
     public function seed(Store $store, Customer $customer, User $user, string $launchMode = 'auto', ?array $aiPreferences = null): ?AiSeedBatch
     {
         if (!Schema::hasTable('ai_seed_batches') || !Schema::hasTable('ai_seed_products') || !Schema::hasTable('products') || !Schema::hasTable('categories')) {
@@ -39,6 +41,7 @@ class AiStoreSeedService
         $businessCategory = $this->businessCategoryForStore($store);
         $blueprint = $this->blueprint($store, $businessCategory, $launchMode, $aiPreferences);
         $imageProfile = $blueprint['product_image_profile'] ?? ['ratio' => '1:1', 'width' => 900, 'height' => 900];
+        $this->usedSeedImageIds = [];
 
         $batch = AiSeedBatch::query()->create([
             'store_id' => $store->id,
@@ -388,7 +391,11 @@ class AiStoreSeedService
     private function blueprint(Store $store, ?BusinessCategory $businessCategory, string $launchMode, ?array $aiPreferences): array
     {
         $previewBlueprint = $aiPreferences['preview_blueprint'] ?? null;
-        if (is_array($previewBlueprint) && isset($previewBlueprint['catalog_blueprint'])) {
+        if (
+            is_array($previewBlueprint)
+            && isset($previewBlueprint['catalog_blueprint'])
+            && $this->blueprintMatchesBusinessCategory($previewBlueprint, $businessCategory)
+        ) {
             return $this->applyCatalogSelection($previewBlueprint, $aiPreferences);
         }
 
@@ -419,6 +426,7 @@ class AiStoreSeedService
                 if ($response->successful() && is_array($response->json())) {
                     $blueprint = $response->json();
                     $blueprint['source'] = $blueprint['source'] ?? 'bot';
+                    $blueprint = $this->attachBlueprintBusinessCategoryMeta($blueprint, $businessCategory);
                     return $this->applyCatalogSelection($blueprint, $aiPreferences);
                 }
             }
@@ -426,7 +434,57 @@ class AiStoreSeedService
             report($e);
         }
 
-        return $this->applyCatalogSelection($this->fallbackBlueprint($payload), $aiPreferences);
+        return $this->applyCatalogSelection($this->attachBlueprintBusinessCategoryMeta($this->fallbackBlueprint($payload), $businessCategory), $aiPreferences);
+    }
+
+    private function attachBlueprintBusinessCategoryMeta(array $blueprint, ?BusinessCategory $businessCategory): array
+    {
+        $blueprint['business_category'] = [
+            'id' => $businessCategory?->id ? (int) $businessCategory->id : null,
+            'name' => (string) ($businessCategory?->name ?? ''),
+            'slug' => (string) ($businessCategory?->slug ?? Str::slug((string) ($businessCategory?->name ?? ''))),
+            'catalog_key' => $this->catalogKeyForBusinessCategory((string) ($businessCategory?->name ?? $businessCategory?->slug ?? '')),
+        ];
+
+        return $blueprint;
+    }
+
+    private function blueprintMatchesBusinessCategory(array $blueprint, ?BusinessCategory $businessCategory): bool
+    {
+        if (!$businessCategory) {
+            return true;
+        }
+
+        $meta = (array) ($blueprint['business_category'] ?? []);
+        $expectedId = (int) $businessCategory->id;
+        if ($expectedId > 0 && (int) ($meta['id'] ?? 0) === $expectedId) {
+            return true;
+        }
+
+        $expectedKey = $this->catalogKeyForBusinessCategory((string) ($businessCategory->name ?? $businessCategory->slug ?? ''));
+        $actualKey = trim((string) ($meta['catalog_key'] ?? ''));
+        if ($actualKey !== '' && $actualKey === $expectedKey) {
+            return true;
+        }
+
+        return false;
+    }
+
+    private function catalogKeyForBusinessCategory(string $categoryName): string
+    {
+        $categoryName = strtolower(trim($categoryName));
+
+        return match (true) {
+            str_contains($categoryName, 'ator'), str_contains($categoryName, 'attar'), str_contains($categoryName, 'itr'), str_contains($categoryName, 'perfume'), str_contains($categoryName, 'fragrance'), str_contains($categoryName, 'oud'), str_contains($categoryName, 'bakhoor'), str_contains($categoryName, 'scent') => 'fragrance',
+            str_contains($categoryName, 'flower'), str_contains($categoryName, 'florist'), str_contains($categoryName, 'bouquet'), str_contains($categoryName, 'plant') => 'flowers',
+            str_contains($categoryName, 'sweet'), str_contains($categoryName, 'mithai'), str_contains($categoryName, 'mishti'), str_contains($categoryName, 'dessert'), str_contains($categoryName, 'bakery'), str_contains($categoryName, 'cake') => 'sweets',
+            str_contains($categoryName, 'pet'), str_contains($categoryName, 'animal'), str_contains($categoryName, 'cat'), str_contains($categoryName, 'dog'), str_contains($categoryName, 'bird'), str_contains($categoryName, 'fish') => 'pet',
+            str_contains($categoryName, 'grocery'), str_contains($categoryName, 'food'), str_contains($categoryName, 'supershop') => 'grocery',
+            str_contains($categoryName, 'electronic'), str_contains($categoryName, 'gadget'), str_contains($categoryName, 'mobile'), str_contains($categoryName, 'computer') => 'electronics',
+            str_contains($categoryName, 'pharmacy'), str_contains($categoryName, 'medicine'), str_contains($categoryName, 'health') => 'pharmacy',
+            str_contains($categoryName, 'fashion'), str_contains($categoryName, 'clothing'), str_contains($categoryName, 'apparel'), str_contains($categoryName, 'boutique') => 'fashion',
+            default => 'general',
+        };
     }
 
     private function botBaseUrls(): array
@@ -516,14 +574,42 @@ class AiStoreSeedService
     {
         $name = (string) ($payload['store_name'] ?? 'Store');
         $categoryName = strtolower((string) ($payload['business_category_name'] ?? 'fashion'));
-        $key = str_contains($categoryName, 'grocery') ? 'grocery'
-            : (str_contains($categoryName, 'electronic') ? 'electronics'
-                : (str_contains($categoryName, 'pharmacy') ? 'pharmacy' : 'fashion'));
+        $key = $this->catalogKeyForBusinessCategory($categoryName);
         $profile = $key === 'fashion'
             ? ['ratio' => '4:5', 'width' => 900, 'height' => 1125, 'fit' => 'cover']
             : ['ratio' => '1:1', 'width' => 900, 'height' => 900, 'fit' => 'cover'];
 
         $catalogs = [
+            'general' => [
+                'categories' => ['Featured Products', 'Best Sellers', 'New Arrivals', 'Gift Items', 'Daily Essentials'],
+                'subcategories' => ['Top Picks', 'Popular Items', 'Latest Items', 'Gift Sets', 'Everyday Use', 'Combo Packs'],
+                'variant_type' => 'unit',
+                'variant_values' => ['1 item', '2 items', 'Combo pack'],
+            ],
+            'fragrance' => [
+                'categories' => ['Premium Attar', 'Oud Collection', 'Daily Fragrances', 'Gift Perfumes', 'Bakhoor & Incense', 'Musk Blends', 'Floral Scents', 'Citrus Fresh', 'Luxury Oils', 'Travel Roll-Ons'],
+                'subcategories' => ['Classic Attar', 'Imported Attar', 'Arabic Oud', 'Cambodi Oud', 'Fresh Day Scents', 'Office Wear', 'Perfume Sets', 'Mini Gift Packs', 'Luxury Bakhoor', 'Incense Sticks', 'White Musk', 'Black Musk', 'Rose Attar', 'Jasmine Attar', 'Lemon Fresh', 'Aqua Fresh', 'Concentrated Oil', 'Signature Blend', '3ml Roll-On', 'Pocket Perfume'],
+                'variant_type' => 'unit',
+                'variant_values' => ['3 ml', '6 ml', '12 ml'],
+            ],
+            'flowers' => [
+                'categories' => ['Fresh Flowers', 'Flower Bouquets', 'Roses', 'Gift Hampers', 'Indoor Plants'],
+                'subcategories' => ['Daily Fresh Mix', 'Birthday Bouquets', 'Red Roses', 'Flower & Chocolate', 'Desk Plants', 'Decor Plants'],
+                'variant_type' => 'unit',
+                'variant_values' => ['Single', 'Small Bouquet', 'Large Bouquet'],
+            ],
+            'sweets' => [
+                'categories' => ['Traditional Sweets', 'Premium Mithai', 'Cakes & Bakery', 'Sweet Boxes', 'Festival Specials'],
+                'subcategories' => ['Rasgulla', 'Sandesh', 'Cakes', 'Assorted Boxes', 'Eid Specials', 'Sweet Hampers'],
+                'variant_type' => 'unit',
+                'variant_values' => ['250g', '500g', '1kg'],
+            ],
+            'pet' => [
+                'categories' => ['Pet Food', 'Pet Treats', 'Cat Care', 'Dog Care', 'Pet Grooming'],
+                'subcategories' => ['Dry Food', 'Training Treats', 'Cat Litter', 'Leashes & Collars', 'Shampoo', 'Pet Toys'],
+                'variant_type' => 'unit',
+                'variant_values' => ['Small', 'Medium', 'Large'],
+            ],
             'fashion' => [
                 'categories' => ['Women Clothing', 'Men Clothing', 'Accessories'],
                 'subcategories' => ['Dresses', 'Tops', 'Shirts', 'Panjabi', 'Bags', 'Sunglasses'],
@@ -560,7 +646,7 @@ class AiStoreSeedService
             $parent = $categories[$index % count($categories)];
             return ['category_slug' => $parent['slug'], 'name' => $label, 'slug' => Str::slug($label)];
         })->values()->all();
-        $products = collect(range(1, 12))->map(function ($index) use ($name, $key, $subcategories, $source) {
+        $products = collect(range(1, 25))->map(function ($index) use ($name, $key, $subcategories, $source) {
             $sub = $subcategories[($index - 1) % count($subcategories)];
             $productName = 'Starter ' . $sub['name'] . ' ' . $index;
             $regular = 500 + ($index * 170);
@@ -602,9 +688,10 @@ class AiStoreSeedService
             return;
         }
 
-        $template = $this->chooseStoreTemplate($blueprint, $businessCategory, $aiPreferences);
+        $template = $this->chooseStoreTemplate($blueprint, $store, $businessCategory, $aiPreferences);
         $sectionValues = $template ? $this->templateSectionValues($template) : [];
-        $sectionValues = $this->fillMissingSectionValuesFromDesignlists($sectionValues, $blueprint, $businessCategory, $aiPreferences, $template);
+        $sectionValues = $this->varyTemplateSectionValues($sectionValues, $blueprint, $store, $businessCategory, $aiPreferences, $template);
+        $sectionValues = $this->fillMissingSectionValuesFromDesignlists($sectionValues, $blueprint, $store, $businessCategory, $aiPreferences, $template);
 
         if (!$template && empty(array_filter($sectionValues))) {
             return;
@@ -616,8 +703,10 @@ class AiStoreSeedService
         $this->setIfColumn($design, 'customer_id', (string) $customer->id);
         $this->setIfColumn($design, 'creator', (string) $user->id);
         $this->setIfColumn($design, 'editor', (string) $user->id);
-        $this->setIfColumn($design, 'header_color', '#ffffff');
-        $this->setIfColumn($design, 'text_color', '#000000');
+        $colors = $this->storefrontHeaderColors($blueprint, $store, $businessCategory, $aiPreferences);
+        $this->setIfColumn($design, 'header_color', $colors['header_color']);
+        $this->setIfColumn($design, 'text_color', $colors['text_color']);
+        $this->setHeaderSectionColors($design, $colors);
         if ($template) {
             $this->setIfColumn($design, 'template_id', (string) $template->id);
         }
@@ -627,6 +716,7 @@ class AiStoreSeedService
                 $this->setIfColumn($design, $column, $sectionValues[$section]);
             }
         }
+        $this->setGeneratedSectionSettings($design, $blueprint, $store, $businessCategory, $aiPreferences, $sectionValues);
 
         $design->save();
 
@@ -640,7 +730,577 @@ class AiStoreSeedService
         $this->syncTemplatePositionsToStore((int) $store->id, $template);
     }
 
-    private function chooseStoreTemplate(array $blueprint, ?BusinessCategory $businessCategory, ?array $aiPreferences): ?Template
+    private function storefrontHeaderColors(array $blueprint, Store $store, ?BusinessCategory $businessCategory, ?array $aiPreferences): array
+    {
+        $seedHeaderColor = $this->normalizeHexColor(
+            (string) (
+                $blueprint['header_color']
+                ?? data_get($blueprint, 'design_blueprint.header_color')
+                ?? data_get($blueprint, 'design.header_color')
+                ?? data_get($aiPreferences, 'header_color')
+                ?? ''
+            )
+        );
+        $seedTextColor = $this->normalizeHexColor(
+            (string) (
+                $blueprint['text_color']
+                ?? data_get($blueprint, 'design_blueprint.text_color')
+                ?? data_get($blueprint, 'design.text_color')
+                ?? data_get($aiPreferences, 'text_color')
+                ?? ''
+            )
+        );
+
+        $generated = $this->generateStorefrontHeaderColorsWithOpenAi(
+            $blueprint,
+            $store,
+            $businessCategory,
+            $aiPreferences,
+            ['header_color' => $seedHeaderColor, 'text_color' => $seedTextColor]
+        );
+        $headerColor = $this->customHeaderPaletteColor((string) ($generated['header_color'] ?? ''))
+            ?: $this->customHeaderPaletteColor($seedHeaderColor);
+        $textColor = $this->normalizeHexColor((string) ($generated['text_color'] ?? '')) ?: $seedTextColor;
+
+        if ($headerColor === '') {
+            $headerColor = $this->fallbackHeaderColor($blueprint, $businessCategory, $aiPreferences);
+        }
+        $headerColor = $this->categorySafeHeaderColor($headerColor, $businessCategory, $blueprint, $aiPreferences);
+
+        if ($textColor === '' || $this->contrastRatio($headerColor, $textColor) < 4.5) {
+            $textColor = $this->bestReadableTextColor($headerColor);
+        }
+
+        return [
+            'header_color' => $headerColor,
+            'text_color' => $textColor,
+        ];
+    }
+
+    private function generateStorefrontHeaderColorsWithOpenAi(array $blueprint, Store $store, ?BusinessCategory $businessCategory, ?array $aiPreferences, array $seedColors = []): array
+    {
+        $apiKey = (string) config('services.openai.api_key');
+        if ($apiKey === '') {
+            return [];
+        }
+
+        $payload = [
+            'store_name' => (string) ($store->name ?? 'Store'),
+            'business_category' => [
+                'id' => $businessCategory?->id ? (int) $businessCategory->id : null,
+                'name' => (string) ($businessCategory?->name ?? $store->type ?? ''),
+                'slug' => (string) ($businessCategory?->slug ?? ''),
+            ],
+            'style_profile' => (string) ($blueprint['style_profile'] ?? data_get($blueprint, 'design_blueprint.style_profile', 'modern-clean')),
+            'tone_preset' => (string) data_get($aiPreferences, 'tone_preset', ''),
+            'primary_goal' => (string) data_get($aiPreferences, 'primary_goal', ''),
+            'brand_colors_hint' => (string) data_get($aiPreferences, 'brand_colors', ''),
+            'allowed_header_colors' => $this->customHeaderColorPalette(),
+            'recommended_header_colors_for_category' => $this->categoryHeaderColorPalette($businessCategory),
+            'suggested_header_color' => (string) ($seedColors['header_color'] ?? ''),
+            'suggested_text_color' => (string) ($seedColors['text_color'] ?? ''),
+        ];
+
+        try {
+            $response = Http::withToken($apiKey)
+                ->acceptJson()
+                ->timeout((int) config('services.openai.timeout', 45))
+                ->post('https://api.openai.com/v1/chat/completions', [
+                    'model' => (string) config('services.openai.model', 'gpt-4o-mini'),
+                    'temperature' => 0.75,
+                    'response_format' => ['type' => 'json_object'],
+                    'messages' => [
+                        [
+                            'role' => 'system',
+                            'content' => implode("\n", [
+                                'You generate ecommerce storefront header colors.',
+                                'Return only JSON with header_color and text_color.',
+                                'Both values must be valid 6-digit hex colors.',
+                                'header_color must be one of the allowed_header_colors from the user custom palette.',
+                                'Prefer recommended_header_colors_for_category when present.',
+                                'Choose a distinctive brand-appropriate header color from the store name, business category, style, tone, and goal.',
+                                'Do not return plain white or plain black as header_color unless explicitly requested by a brand color hint.',
+                                'text_color must have at least WCAG AA contrast on header_color.',
+                            ]),
+                        ],
+                        ['role' => 'user', 'content' => json_encode($payload, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES)],
+                    ],
+                ]);
+        } catch (Throwable $e) {
+            report($e);
+            return [];
+        }
+
+        if (!$response->successful()) {
+            return [];
+        }
+
+        $decoded = json_decode((string) data_get($response->json(), 'choices.0.message.content', ''), true);
+        return is_array($decoded) ? $decoded : [];
+    }
+
+    private function fallbackHeaderColor(array $blueprint, ?BusinessCategory $businessCategory, ?array $aiPreferences): string
+    {
+        $hint = strtolower(trim(implode(' ', array_filter([
+            (string) data_get($aiPreferences, 'brand_colors', ''),
+            (string) ($businessCategory?->name ?? ''),
+            (string) ($businessCategory?->slug ?? ''),
+            (string) ($blueprint['style_profile'] ?? ''),
+        ]))));
+
+        if (preg_match('/#(?:[0-9a-f]{3}){1,2}\b/i', $hint, $matches)) {
+            $color = $this->customHeaderPaletteColor($matches[0]);
+            if ($color !== '') {
+                return $color;
+            }
+        }
+
+        $named = [
+            'perfume' => '#7C3AED',
+            'fragrance' => '#7C3AED',
+            'attar' => '#7C3AED',
+            'flower' => '#F43F5E',
+            'sweet' => '#F59E0B',
+            'bakery' => '#F59E0B',
+            'pet' => '#10B981',
+            'grocery' => '#10B981',
+            'food' => '#10B981',
+            'electronic' => '#4F7BD9',
+            'gadget' => '#4F7BD9',
+            'pharmacy' => '#10B981',
+            'health' => '#10B981',
+            'fashion' => '#F43F5E',
+            'boutique' => '#F43F5E',
+            'premium' => '#7C3AED',
+            'bold' => '#F59E0B',
+            'minimal' => '#334155',
+        ];
+
+        foreach ($named as $needle => $color) {
+            if (str_contains($hint, $needle)) {
+                return $this->customHeaderPaletteColor($color) ?: '#4F7BD9';
+            }
+        }
+
+        $palette = $this->customHeaderColorPalette();
+        $seed = (string) ($businessCategory?->id ?? '') . '|' . (string) data_get($aiPreferences, 'style_preset', '') . '|' . (string) data_get($aiPreferences, 'primary_goal', '');
+        return $palette[(int) (abs(crc32($seed)) % count($palette))] ?? '#4F7BD9';
+    }
+
+    private function customHeaderColorPalette(): array
+    {
+        return ['#4F7BD9', '#10B981', '#F43F5E', '#F59E0B', '#7C3AED', '#334155'];
+    }
+
+    private function customHeaderPaletteColor(string $color): string
+    {
+        $color = $this->normalizeHexColor($color);
+        if ($color === '') {
+            return '';
+        }
+
+        return in_array($color, $this->customHeaderColorPalette(), true) ? $color : '';
+    }
+
+    private function categoryHeaderColorPalette(?BusinessCategory $businessCategory): array
+    {
+        $categoryKey = $this->catalogKeyForBusinessCategory((string) ($businessCategory?->name ?? $businessCategory?->slug ?? ''));
+        return match ($categoryKey) {
+            'pharmacy', 'grocery', 'pet' => ['#10B981', '#334155', '#4F7BD9'],
+            'sweets' => ['#F59E0B', '#F43F5E', '#7C3AED'],
+            'flowers', 'fashion' => ['#F43F5E', '#7C3AED', '#4F7BD9'],
+            'electronics' => ['#4F7BD9', '#334155', '#7C3AED'],
+            'fragrance' => ['#7C3AED', '#334155', '#F59E0B'],
+            default => $this->customHeaderColorPalette(),
+        };
+    }
+
+    private function categorySafeHeaderColor(string $color, ?BusinessCategory $businessCategory, array $blueprint, ?array $aiPreferences): string
+    {
+        $allowed = $this->categoryHeaderColorPalette($businessCategory);
+        if (in_array($color, $allowed, true)) {
+            return $color;
+        }
+
+        $fallback = $this->fallbackHeaderColor($blueprint, $businessCategory, $aiPreferences);
+        return in_array($fallback, $allowed, true) ? $fallback : ($allowed[0] ?? '#4F7BD9');
+    }
+
+    private function setHeaderSectionColors(Design $design, array $colors): void
+    {
+        if (!Schema::hasColumn('designs', 'section_settings')) {
+            return;
+        }
+
+        $settings = [];
+        $raw = $design->section_settings ?? null;
+        if (is_string($raw) && trim($raw) !== '') {
+            $decoded = json_decode($raw, true);
+            $settings = is_array($decoded) ? $decoded : [];
+        } elseif (is_array($raw)) {
+            $settings = $raw;
+        }
+
+        $header = is_array($settings['header'] ?? null) ? $settings['header'] : [];
+        $header['header_color'] = $colors['header_color'];
+        $header['text_color'] = $colors['text_color'];
+        $settings['header'] = $header;
+        $design->section_settings = json_encode($settings);
+    }
+
+    private function setGeneratedSectionSettings(Design $design, array $blueprint, Store $store, ?BusinessCategory $businessCategory, ?array $aiPreferences, array $sectionValues): void
+    {
+        if (!Schema::hasColumn('designs', 'section_settings')) {
+            return;
+        }
+
+        $settings = $this->decodeSectionSettings($design->section_settings ?? null);
+        $generated = $this->storefrontSectionCopy($blueprint, $store, $businessCategory, $aiPreferences);
+
+        foreach ($this->sectionSettingsTargets() as $frontendKey => $target) {
+            $section = is_array($settings[$frontendKey] ?? null) ? $settings[$frontendKey] : [];
+            $copy = is_array($generated[$frontendKey] ?? null) ? $generated[$frontendKey] : [];
+            $backendKey = (string) ($target['backend_key'] ?? $frontendKey);
+            $group = (string) ($target['group'] ?? 'content');
+
+            $section['show_heading'] = array_key_exists('show_heading', $section) ? (bool) $section['show_heading'] : true;
+            $section['show_on_mobile'] = array_key_exists('show_on_mobile', $section) ? (bool) $section['show_on_mobile'] : true;
+            $section['boxed'] = array_key_exists('boxed', $section) ? (bool) $section['boxed'] : false;
+            $section['compact_mode'] = array_key_exists('compact_mode', $section) ? (bool) $section['compact_mode'] : false;
+            $section['headline'] = $this->cleanSectionCopy((string) ($copy['headline'] ?? ''), 64)
+                ?: (string) ($target['fallback_headline'] ?? Str::headline($frontendKey));
+            $section['helper_text'] = $this->cleanSectionCopy((string) ($copy['helper_text'] ?? ''), 140)
+                ?: (string) ($target['fallback_helper'] ?? '');
+
+            if ($this->sectionValueIsUsable($sectionValues[$backendKey] ?? null)) {
+                $section['template'] = (string) $sectionValues[$backendKey];
+            }
+
+            if ($group === 'product') {
+                $section['columns'] = (string) ($section['columns'] ?? '4');
+                $section['card_style'] = (string) ($section['card_style'] ?? 'grid');
+                $section['section_theme'] = (string) ($section['section_theme'] ?? 'soft');
+                $section['show_view_all'] = array_key_exists('show_view_all', $section) ? (bool) $section['show_view_all'] : true;
+                $section['view_all_label'] = $this->cleanSectionCopy((string) ($copy['view_all_label'] ?? ''), 24) ?: 'View all';
+            } elseif ($group === 'promo') {
+                $section['columns'] = (string) ($section['columns'] ?? '3');
+                $section['content_align'] = (string) ($section['content_align'] ?? 'left');
+                $section['section_theme'] = (string) ($section['section_theme'] ?? 'soft');
+                $section['show_badge'] = array_key_exists('show_badge', $section) ? (bool) $section['show_badge'] : true;
+                $section['primary_button_label'] = $this->cleanSectionCopy((string) ($copy['primary_button_label'] ?? ''), 24) ?: 'Explore';
+            } else {
+                $section['content_align'] = (string) ($section['content_align'] ?? 'left');
+                $section['section_theme'] = (string) ($section['section_theme'] ?? 'minimal');
+                if (in_array($frontendKey, ['about', 'blog', 'youtube', 'footer'], true)) {
+                    $section['primary_button_label'] = $this->cleanSectionCopy((string) ($copy['primary_button_label'] ?? ''), 24) ?: 'Learn more';
+                }
+            }
+
+            $settings[$frontendKey] = $section;
+        }
+
+        $design->section_settings = json_encode($settings);
+    }
+
+    private function decodeSectionSettings($raw): array
+    {
+        if (is_string($raw) && trim($raw) !== '') {
+            $decoded = json_decode($raw, true);
+            return is_array($decoded) ? $decoded : [];
+        }
+
+        return is_array($raw) ? $raw : [];
+    }
+
+    private function storefrontSectionCopy(array $blueprint, Store $store, ?BusinessCategory $businessCategory, ?array $aiPreferences): array
+    {
+        $fallback = $this->fallbackSectionCopy($store, $businessCategory);
+        $generated = $this->generateStorefrontSectionCopyWithOpenAi($blueprint, $store, $businessCategory, $aiPreferences);
+
+        foreach ($generated as $key => $copy) {
+            if (!isset($fallback[$key]) || !is_array($copy)) {
+                continue;
+            }
+            $headline = $this->cleanSectionCopy((string) ($copy['headline'] ?? ''), 64);
+            if ($headline !== '' && !$this->sectionCopyIsCategorySafe($headline, $businessCategory)) {
+                $headline = '';
+            }
+            $fallback[$key] = array_merge($fallback[$key], array_filter([
+                'headline' => $headline,
+                'helper_text' => $this->cleanSectionCopy((string) ($copy['helper_text'] ?? ''), 140),
+                'view_all_label' => $this->cleanSectionCopy((string) ($copy['view_all_label'] ?? ''), 24),
+                'primary_button_label' => $this->cleanSectionCopy((string) ($copy['primary_button_label'] ?? ''), 24),
+            ], fn ($value) => $value !== ''));
+        }
+
+        return $fallback;
+    }
+
+    private function generateStorefrontSectionCopyWithOpenAi(array $blueprint, Store $store, ?BusinessCategory $businessCategory, ?array $aiPreferences): array
+    {
+        $apiKey = (string) config('services.openai.api_key');
+        if ($apiKey === '') {
+            return [];
+        }
+
+        $catalog = (array) ($blueprint['catalog_blueprint'] ?? []);
+        $targets = collect($this->sectionSettingsTargets())
+            ->map(fn ($target, $key) => [
+                'key' => $key,
+                'label' => (string) ($target['label'] ?? Str::headline((string) $key)),
+                'purpose' => (string) ($target['purpose'] ?? ''),
+            ])
+            ->values()
+            ->all();
+        $payload = [
+            'store_name' => (string) ($store->name ?? 'Store'),
+            'business_category' => [
+                'name' => (string) ($businessCategory?->name ?? $store->type ?? ''),
+                'slug' => (string) ($businessCategory?->slug ?? ''),
+                'catalog_key' => $this->catalogKeyForBusinessCategory((string) ($businessCategory?->name ?? $businessCategory?->slug ?? $store->type ?? '')),
+            ],
+            'category_copy_rules' => $this->sectionCopyCategoryRules($businessCategory, $store),
+            'style_profile' => (string) ($blueprint['style_profile'] ?? data_get($blueprint, 'design_blueprint.style_profile', 'modern-clean')),
+            'tone_preset' => (string) data_get($aiPreferences, 'tone_preset', ''),
+            'primary_goal' => (string) data_get($aiPreferences, 'primary_goal', ''),
+            'categories' => collect((array) ($catalog['categories'] ?? []))->pluck('name')->filter()->take(8)->values()->all(),
+            'products' => collect((array) ($catalog['products'] ?? []))->pluck('name')->filter()->take(10)->values()->all(),
+            'sections' => $targets,
+        ];
+
+        try {
+            $response = Http::withToken($apiKey)
+                ->acceptJson()
+                ->timeout((int) config('services.openai.timeout', 45))
+                ->post('https://api.openai.com/v1/chat/completions', [
+                    'model' => (string) config('services.openai.model', 'gpt-4o-mini'),
+                    'temperature' => 0.78,
+                    'response_format' => ['type' => 'json_object'],
+                    'messages' => [
+                        [
+                            'role' => 'system',
+                            'content' => implode("\n", [
+                                'You generate ecommerce storefront section copy.',
+                                'Return only JSON with this shape: {"sections":{"section_key":{"headline":"...","helper_text":"...","view_all_label":"...","primary_button_label":"..."}}}.',
+                                'Generate every section_key from the payload and do not invent extra keys.',
+                                'Each headline must be unique, customer-facing, interactive, and 2 to 6 words.',
+                                'Write headlines like inviting storefront copy shoppers would click, not admin section names.',
+                                'Prefer active, benefit-led words such as discover, find, shop, explore, trusted, fresh, ready, selected, or recommended.',
+                                'Each helper_text must be unique, natural, and 8 to 16 words with a clear shopper benefit.',
+                                'Strictly match the store name, business category, product catalog, style, tone, goal, and category_copy_rules.',
+                                'Avoid generic repeated titles such as Featured Products, Product Details, Latest Stories, or Best Sellers unless the category makes them feel specific.',
+                                'For medicine, pharmacy, health, wellness, supplement, medical, or care stores, avoid romantic, gift-like, playful, or emotional wording such as love, loved, favorites, perfect match, treat yourself, or picked for you.',
+                                'For medicine/pharmacy/health stores, use professional shopping language around health essentials, trusted care, wellness needs, pharmacy picks, daily care, and safe checkout.',
+                                'Button labels must be 1 to 3 words and action-oriented.',
+                            ]),
+                        ],
+                        ['role' => 'user', 'content' => json_encode($payload, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES)],
+                    ],
+                ]);
+        } catch (Throwable $e) {
+            report($e);
+            return [];
+        }
+
+        if (!$response->successful()) {
+            return [];
+        }
+
+        $decoded = json_decode((string) data_get($response->json(), 'choices.0.message.content', ''), true);
+        return is_array($decoded['sections'] ?? null) ? $decoded['sections'] : [];
+    }
+
+    private function fallbackSectionCopy(Store $store, ?BusinessCategory $businessCategory): array
+    {
+        $category = trim((string) ($businessCategory?->name ?? $store->type ?? 'products'));
+        $categoryLabel = $category !== '' ? Str::headline($category) : 'Products';
+        $categoryKey = $this->catalogKeyForBusinessCategory((string) ($businessCategory?->name ?? $businessCategory?->slug ?? $store->type ?? ''));
+
+        if ($categoryKey === 'pharmacy') {
+            return [
+                'slider' => ['headline' => "Shop {$store->name}", 'helper_text' => 'Find health essentials, daily care items, and trusted pharmacy products.', 'primary_button_label' => 'Shop now'],
+                'banner' => ['headline' => 'Care Deals Today', 'helper_text' => 'Explore timely savings on everyday wellness and care products.', 'primary_button_label' => 'Explore'],
+                'banner-bottom' => ['headline' => 'Find Daily Care', 'helper_text' => 'Browse practical health needs grouped for quick, confident shopping.', 'primary_button_label' => 'Browse'],
+                'announcement' => ['headline' => 'Health Store Updates', 'helper_text' => 'Check important notices, availability updates, and active care offers.', 'primary_button_label' => 'View'],
+                'feature-category' => ['headline' => 'Shop Health Needs', 'helper_text' => 'Move through wellness, personal care, and pharmacy categories faster.', 'view_all_label' => 'View all'],
+                'product' => ['headline' => 'Health Essentials', 'helper_text' => 'Browse practical products selected for everyday care and wellness needs.', 'view_all_label' => 'View all'],
+                'feature-product' => ['headline' => 'Trusted Care Picks', 'helper_text' => 'Review highlighted items for daily health, comfort, and personal care.', 'view_all_label' => 'Explore'],
+                'best-sell-product' => ['headline' => 'Most Chosen Care', 'helper_text' => 'See frequently selected wellness products shoppers rely on regularly.', 'view_all_label' => 'Shop care'],
+                'new-arrival' => ['headline' => 'New Health Arrivals', 'helper_text' => 'Check newly added care products, wellness items, and pharmacy essentials.', 'view_all_label' => 'See new'],
+                'testimonial' => ['headline' => 'Trusted by Shoppers', 'helper_text' => 'Read feedback that helps health shoppers buy with confidence.'],
+                'youtube' => ['headline' => 'Learn Before You Buy', 'helper_text' => 'Watch helpful product explainers, care tips, and store updates.', 'primary_button_label' => 'Watch'],
+                'about' => ['headline' => 'Know This Pharmacy', 'helper_text' => 'Learn what care products we provide and how we serve shoppers.', 'primary_button_label' => 'Read more'],
+                'newsletter' => ['headline' => 'Get Care Updates', 'helper_text' => 'Hear about health arrivals, stock updates, and useful wellness offers.', 'primary_button_label' => 'Subscribe'],
+                'brand' => ['headline' => 'Trusted Health Brands', 'helper_text' => 'Browse reliable brands and care collections chosen for everyday needs.'],
+                'blog' => ['headline' => 'Read Wellness Guides', 'helper_text' => 'Find practical care tips and product guidance before shopping.', 'primary_button_label' => 'Read'],
+                'offer' => ['headline' => 'Save on Care', 'helper_text' => 'Catch timely savings on daily wellness and personal care products.', 'primary_button_label' => 'Claim offer'],
+                'footer' => ['headline' => 'Need Store Help?', 'helper_text' => 'Find support, policies, and useful links for your health order.', 'primary_button_label' => 'Contact'],
+                'shop-page' => ['headline' => 'Browse Health Products', 'helper_text' => 'Filter and choose care products with clearer shopping context.'],
+                'single-product-page' => ['headline' => 'Review Care Details', 'helper_text' => 'Check key product information before adding this item to cart.'],
+                'checkout-page' => ['headline' => 'Complete Secure Checkout', 'helper_text' => 'Finish your health order through a clear and focused checkout.'],
+                'login-page' => ['headline' => 'Access Your Account', 'helper_text' => 'Review orders, addresses, and saved details without slowing down.'],
+                'product-card' => ['headline' => 'Quick Care Preview', 'helper_text' => 'Scan prices, images, and product actions while browsing.'],
+            ];
+        }
+
+        return [
+            'slider' => ['headline' => "Discover {$store->name}", 'helper_text' => "Start with curated {$categoryLabel} picks made for easy shopping.", 'primary_button_label' => 'Shop now'],
+            'banner' => ['headline' => 'Grab Fresh Deals', 'helper_text' => "Explore timely offers across the {$categoryLabel} picks shoppers ask for most.", 'primary_button_label' => 'Explore'],
+            'banner-bottom' => ['headline' => 'Find More Favorites', 'helper_text' => 'Browse useful picks grouped for quick decisions and easy checkout.', 'primary_button_label' => 'Browse'],
+            'announcement' => ['headline' => 'Do Not Miss This', 'helper_text' => 'Catch important launches, notices, and active offers before they end.', 'primary_button_label' => 'View'],
+            'feature-category' => ['headline' => 'Choose Your Category', 'helper_text' => "Jump into curated {$categoryLabel} collections and find the right fit faster.", 'view_all_label' => 'View all'],
+            'product' => ['headline' => 'Pick What You Love', 'helper_text' => 'Discover reliable products selected to make shopping quicker and easier.', 'view_all_label' => 'View all'],
+            'feature-product' => ['headline' => 'Explore Our Favorites', 'helper_text' => 'Handpicked highlights that help shoppers spot the strongest catalog choices.', 'view_all_label' => 'Explore'],
+            'best-sell-product' => ['headline' => 'Shop Customer Favorites', 'helper_text' => 'Trusted choices picked often by shoppers who know what works.', 'view_all_label' => 'Shop best'],
+            'new-arrival' => ['headline' => 'See What Is New', 'helper_text' => 'Freshly added items ready to make every visit feel worth checking.', 'view_all_label' => 'See new'],
+            'testimonial' => ['headline' => 'See Why They Trust Us', 'helper_text' => 'Read real feedback that helps new shoppers buy with confidence.'],
+            'youtube' => ['headline' => 'Watch Before You Shop', 'helper_text' => 'Explore product stories, demos, and brand moments in a richer format.', 'primary_button_label' => 'Watch'],
+            'about' => ['headline' => 'Know Your Store', 'helper_text' => 'Learn what we sell, why it matters, and how we serve you.', 'primary_button_label' => 'Read more'],
+            'newsletter' => ['headline' => 'Get First Updates', 'helper_text' => 'Hear about launches, offers, and useful product news before others.', 'primary_button_label' => 'Subscribe'],
+            'brand' => ['headline' => 'Shop Trusted Brands', 'helper_text' => 'Browse trusted names and collections chosen to make buying easier.'],
+            'blog' => ['headline' => 'Read Helpful Guides', 'helper_text' => 'Find buying tips, updates, and inspiration before choosing your next item.', 'primary_button_label' => 'Read'],
+            'offer' => ['headline' => 'Claim Today’s Offer', 'helper_text' => 'Catch timely savings and bundles before you move to checkout.', 'primary_button_label' => 'Claim offer'],
+            'footer' => ['headline' => 'Need Help Shopping?', 'helper_text' => 'Find support, policies, and helpful links whenever you need them.', 'primary_button_label' => 'Contact'],
+            'shop-page' => ['headline' => 'Find Your Next Pick', 'helper_text' => 'Filter, compare, and choose the right product with less effort.'],
+            'single-product-page' => ['headline' => 'Ready to Buy?', 'helper_text' => 'Review the details that matter before adding this item to cart.'],
+            'checkout-page' => ['headline' => 'Finish Your Order', 'helper_text' => 'Complete your purchase through a clear, focused, and secure checkout.'],
+            'login-page' => ['headline' => 'Welcome Back Shopper', 'helper_text' => 'Access orders, addresses, and saved details without slowing down.'],
+            'product-card' => ['headline' => 'Quick Product Preview', 'helper_text' => 'Scan prices, images, and actions quickly while browsing the store.'],
+        ];
+    }
+
+    private function sectionCopyCategoryRules(?BusinessCategory $businessCategory, Store $store): array
+    {
+        $categoryKey = $this->catalogKeyForBusinessCategory((string) ($businessCategory?->name ?? $businessCategory?->slug ?? $store->type ?? ''));
+        if ($categoryKey === 'pharmacy') {
+            return [
+                'voice' => 'professional, clear, trust-first, health-shopping focused',
+                'use_words' => ['health essentials', 'trusted care', 'wellness needs', 'daily care', 'pharmacy products', 'personal care'],
+                'avoid_words' => ['love', 'loved', 'favorites', 'perfect match', 'treat yourself', 'picked for you', 'gift', 'romantic'],
+            ];
+        }
+
+        return [
+            'voice' => 'customer-facing, category-specific, natural ecommerce copy',
+            'use_words' => ['discover', 'find', 'shop', 'explore', 'trusted', 'selected', 'new'],
+            'avoid_words' => ['generic section names', 'duplicate titles', 'admin labels'],
+        ];
+    }
+
+    private function sectionCopyIsCategorySafe(string $headline, ?BusinessCategory $businessCategory): bool
+    {
+        $categoryKey = $this->catalogKeyForBusinessCategory((string) ($businessCategory?->name ?? $businessCategory?->slug ?? ''));
+        if ($categoryKey !== 'pharmacy') {
+            return true;
+        }
+
+        $normalized = strtolower($headline);
+        foreach (['love', 'loved', 'favorite', 'favourite', 'perfect match', 'treat yourself', 'picked for you', 'gift'] as $blocked) {
+            if (str_contains($normalized, $blocked)) {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    private function sectionSettingsTargets(): array
+    {
+        return [
+            'slider' => ['backend_key' => 'hero_slider', 'group' => 'promo', 'label' => 'Hero slider', 'purpose' => 'top storefront campaign and primary shopping CTA'],
+            'banner' => ['backend_key' => 'banner', 'group' => 'promo', 'label' => 'Top banner', 'purpose' => 'promotional merchandising strip'],
+            'banner-bottom' => ['backend_key' => 'banner_bottom', 'group' => 'promo', 'label' => 'Bottom banner', 'purpose' => 'secondary promotional area'],
+            'announcement' => ['backend_key' => 'announcement', 'group' => 'promo', 'label' => 'Announcement', 'purpose' => 'short storewide announcement or notice'],
+            'feature-category' => ['backend_key' => 'feature_category', 'group' => 'product', 'label' => 'Featured categories', 'purpose' => 'category discovery section'],
+            'product' => ['backend_key' => 'product', 'group' => 'product', 'label' => 'Product section', 'purpose' => 'main all-products merchandising section'],
+            'feature-product' => ['backend_key' => 'feature_product', 'group' => 'product', 'label' => 'Featured products', 'purpose' => 'curated highlighted products'],
+            'best-sell-product' => ['backend_key' => 'best_sell_product', 'group' => 'product', 'label' => 'Best-selling products', 'purpose' => 'trust-building top sellers'],
+            'new-arrival' => ['backend_key' => 'new_arrival', 'group' => 'product', 'label' => 'New arrivals', 'purpose' => 'fresh catalog additions'],
+            'testimonial' => ['backend_key' => 'testimonial', 'group' => 'content', 'label' => 'Testimonials', 'purpose' => 'customer proof and credibility'],
+            'youtube' => ['backend_key' => 'youtube', 'group' => 'content', 'label' => 'YouTube video', 'purpose' => 'video storytelling and product education'],
+            'about' => ['backend_key' => 'about', 'group' => 'content', 'label' => 'About section', 'purpose' => 'brand and store introduction'],
+            'newsletter' => ['backend_key' => 'newsletter', 'group' => 'content', 'label' => 'Newsletter', 'purpose' => 'email signup section'],
+            'brand' => ['backend_key' => 'brand', 'group' => 'content', 'label' => 'Brand section', 'purpose' => 'brand logo or supplier trust section'],
+            'blog' => ['backend_key' => 'blog', 'group' => 'content', 'label' => 'Blog section', 'purpose' => 'content and buying guide section'],
+            'offer' => ['backend_key' => 'offer', 'group' => 'promo', 'label' => 'Offer section', 'purpose' => 'special deals and conversion pushes'],
+            'footer' => ['backend_key' => 'footer', 'group' => 'content', 'label' => 'Footer', 'purpose' => 'support and closing navigation'],
+            'shop-page' => ['backend_key' => 'shop_page', 'group' => 'content', 'label' => 'Shop page', 'purpose' => 'product listing page heading'],
+            'single-product-page' => ['backend_key' => 'single_product_page', 'group' => 'content', 'label' => 'Single product page', 'purpose' => 'product detail page heading'],
+            'checkout-page' => ['backend_key' => 'checkout_page', 'group' => 'content', 'label' => 'Checkout page', 'purpose' => 'checkout page heading'],
+            'login-page' => ['backend_key' => 'login_page', 'group' => 'content', 'label' => 'Login page', 'purpose' => 'customer account login heading'],
+            'product-card' => ['backend_key' => 'product_card', 'group' => 'content', 'label' => 'Product card', 'purpose' => 'product card copy settings'],
+        ];
+    }
+
+    private function cleanSectionCopy(string $text, int $limit): string
+    {
+        $text = trim(preg_replace('/\s+/u', ' ', strip_tags($text)) ?: '');
+        $text = trim($text, "\"'`“”‘’");
+        if ($text === '') {
+            return '';
+        }
+
+        return Str::limit($text, $limit, '');
+    }
+
+    private function normalizeHexColor(string $color): string
+    {
+        $color = trim($color);
+        if ($color === '') {
+            return '';
+        }
+        if (!str_starts_with($color, '#')) {
+            $color = '#' . $color;
+        }
+        if (preg_match('/^#([0-9a-fA-F]{3})$/', $color, $matches)) {
+            $short = $matches[1];
+            return '#' . strtoupper($short[0] . $short[0] . $short[1] . $short[1] . $short[2] . $short[2]);
+        }
+        if (preg_match('/^#[0-9a-fA-F]{6}$/', $color)) {
+            return strtoupper($color);
+        }
+
+        return '';
+    }
+
+    private function bestReadableTextColor(string $background): string
+    {
+        $blackContrast = $this->contrastRatio($background, '#111827');
+        $whiteContrast = $this->contrastRatio($background, '#FFFFFF');
+        return $blackContrast >= $whiteContrast ? '#111827' : '#FFFFFF';
+    }
+
+    private function contrastRatio(string $first, string $second): float
+    {
+        $firstLum = $this->relativeLuminance($first);
+        $secondLum = $this->relativeLuminance($second);
+        $lighter = max($firstLum, $secondLum);
+        $darker = min($firstLum, $secondLum);
+        return ($lighter + 0.05) / ($darker + 0.05);
+    }
+
+    private function relativeLuminance(string $color): float
+    {
+        $rgb = $this->hexToRgb($color);
+        $channels = array_map(function ($channel) {
+            $value = $channel / 255;
+            return $value <= 0.03928 ? $value / 12.92 : (($value + 0.055) / 1.055) ** 2.4;
+        }, $rgb);
+
+        return (0.2126 * $channels[0]) + (0.7152 * $channels[1]) + (0.0722 * $channels[2]);
+    }
+
+    private function hexToRgb(string $color): array
+    {
+        $color = $this->normalizeHexColor($color) ?: '#000000';
+        return [
+            hexdec(substr($color, 1, 2)),
+            hexdec(substr($color, 3, 2)),
+            hexdec(substr($color, 5, 2)),
+        ];
+    }
+
+    private function chooseStoreTemplate(array $blueprint, Store $store, ?BusinessCategory $businessCategory, ?array $aiPreferences): ?Template
     {
         if (!Schema::hasTable('templates')) {
             return null;
@@ -650,7 +1310,7 @@ class AiStoreSeedService
             ?? $blueprint['design']['template_id']
             ?? $aiPreferences['template_id']
             ?? null;
-        if ($requested && ($template = Template::query()->find((int) $requested)) && $this->isActiveStatus($template->status ?? 'active')) {
+        if ($this->templateRequestIsLocked($aiPreferences) && $requested && ($template = Template::query()->find((int) $requested)) && $this->isActiveStatus($template->status ?? 'active')) {
             return $template;
         }
 
@@ -660,7 +1320,7 @@ class AiStoreSeedService
             ?? $aiPreferences['template_value']
             ?? ''
         ));
-        if ($requestedValue !== '') {
+        if ($this->templateRequestIsLocked($aiPreferences) && $requestedValue !== '') {
             $template = Template::query()
                 ->where(function ($query) use ($requestedValue) {
                     $query->where('value', $requestedValue)->orWhere('name', $requestedValue);
@@ -691,7 +1351,19 @@ class AiStoreSeedService
             ->sortByDesc('score')
             ->values();
 
-        return $ranked->first()['template'] ?? $templates->first();
+        $maxScore = (int) ($ranked->max('score') ?? 0);
+        $pool = $ranked
+            ->filter(fn ($item) => (int) $item['score'] >= $maxScore - 24)
+            ->values();
+        $recentTemplateIds = $this->recentTemplateIdsForCategory($store, $businessCategory);
+        $freshPool = $pool
+            ->reject(fn ($item) => in_array((int) ($item['template']->id ?? 0), $recentTemplateIds, true))
+            ->values();
+
+        $selectedPool = $freshPool->isNotEmpty() ? $freshPool : $pool;
+        $selected = $this->spreadPick($selectedPool->all(), 'template', $store, $businessCategory);
+
+        return $selected['template'] ?? $ranked->first()['template'] ?? $templates->first();
     }
 
     private function templateMatchScore(Template $template, array $blueprint, ?BusinessCategory $businessCategory, ?array $aiPreferences): int
@@ -720,10 +1392,187 @@ class AiStoreSeedService
             }
         }
 
+        $requestedId = (int) (
+            $blueprint['design_blueprint']['template_id']
+            ?? $blueprint['design']['template_id']
+            ?? $aiPreferences['template_id']
+            ?? 0
+        );
+        if ($requestedId > 0 && (int) ($template->id ?? 0) === $requestedId) {
+            $score += 18;
+        }
+
+        $requestedValue = strtolower(trim((string) (
+            $blueprint['design_blueprint']['template_value']
+            ?? $blueprint['design']['template_value']
+            ?? $aiPreferences['template_value']
+            ?? ''
+        )));
+        if ($requestedValue !== '' && in_array($requestedValue, [
+            strtolower(trim((string) ($template->value ?? ''))),
+            strtolower(trim((string) ($template->name ?? ''))),
+        ], true)) {
+            $score += 18;
+        }
+
         return $score;
     }
 
-    private function fillMissingSectionValuesFromDesignlists(array $sectionValues, array $blueprint, ?BusinessCategory $businessCategory, ?array $aiPreferences, ?Template $template = null): array
+    private function templateRequestIsLocked(?array $aiPreferences): bool
+    {
+        $aiPreferences = (array) $aiPreferences;
+        foreach (['template_locked', 'template_lock', 'lock_template', 'manual_template'] as $key) {
+            if (filter_var($aiPreferences[$key] ?? false, FILTER_VALIDATE_BOOL)) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private function recentTemplateIdsForCategory(Store $store, ?BusinessCategory $businessCategory): array
+    {
+        if (!Schema::hasTable('stores') || !Schema::hasColumn('stores', 'template_id')) {
+            return [];
+        }
+
+        $query = Store::query()
+            ->where('id', '<>', (int) $store->id)
+            ->whereNotNull('template_id')
+            ->where('template_id', '<>', '')
+            ->where('template_id', '<>', '0')
+            ->orderByDesc('id')
+            ->limit(12);
+
+        $categoryId = $businessCategory?->id ? (string) $businessCategory->id : '';
+        if ($categoryId !== '') {
+            $hasCategoryColumn = Schema::hasColumn('stores', 'category_id');
+            $hasTypeColumn = Schema::hasColumn('stores', 'type');
+            if ($hasCategoryColumn || $hasTypeColumn) {
+                $query->where(function ($subQuery) use ($categoryId, $hasCategoryColumn, $hasTypeColumn) {
+                    if ($hasCategoryColumn) {
+                        $subQuery->where('category_id', $categoryId);
+                    }
+                    if ($hasTypeColumn) {
+                        $hasCategoryColumn ? $subQuery->orWhere('type', $categoryId) : $subQuery->where('type', $categoryId);
+                    }
+                });
+            }
+        }
+
+        return $query->pluck('template_id')
+            ->map(fn ($id) => (int) $id)
+            ->filter(fn ($id) => $id > 0)
+            ->unique()
+            ->values()
+            ->all();
+    }
+
+    private function recentDesignValuesForCategory(string $section, Store $store, ?BusinessCategory $businessCategory): array
+    {
+        $column = $this->designSectionColumnMap()[$section] ?? null;
+        if (!$column || !Schema::hasTable('designs') || !Schema::hasColumn('designs', 'store_id') || !Schema::hasColumn('designs', $column)) {
+            return [];
+        }
+
+        $query = DB::table('designs')
+            ->where('designs.store_id', '<>', (int) $store->id)
+            ->whereNotNull("designs.{$column}")
+            ->where("designs.{$column}", '<>', '')
+            ->where("designs.{$column}", '<>', '0')
+            ->where("designs.{$column}", '<>', 'none')
+            ->orderByDesc('designs.id')
+            ->limit(16);
+
+        $categoryId = $businessCategory?->id ? (string) $businessCategory->id : '';
+        if ($categoryId !== '' && Schema::hasTable('stores')) {
+            $storeCategoryColumns = array_values(array_filter(['category_id', 'type'], fn ($column) => Schema::hasColumn('stores', $column)));
+            if (!empty($storeCategoryColumns)) {
+                $query->join('stores', 'stores.id', '=', 'designs.store_id')
+                    ->where(function ($subQuery) use ($storeCategoryColumns, $categoryId) {
+                        foreach ($storeCategoryColumns as $index => $column) {
+                            $index === 0
+                                ? $subQuery->where("stores.{$column}", $categoryId)
+                                : $subQuery->orWhere("stores.{$column}", $categoryId);
+                        }
+                    });
+            }
+        }
+
+        return $query->pluck("designs.{$column}")
+            ->map(fn ($value) => trim((string) $value))
+            ->filter(fn ($value) => $this->sectionValueIsUsable($value))
+            ->unique()
+            ->values()
+            ->all();
+    }
+
+    private function spreadPick(array $items, string $salt, Store $store, ?BusinessCategory $businessCategory): ?array
+    {
+        if (empty($items)) {
+            return null;
+        }
+
+        $seed = implode('|', [
+            $salt,
+            (string) ($store->id ?? ''),
+            (string) ($store->name ?? ''),
+            (string) ($store->slug ?? ''),
+            (string) ($businessCategory?->id ?? ''),
+        ]);
+        $index = (int) (abs(crc32($seed)) % count($items));
+
+        return $items[$index] ?? $items[0];
+    }
+
+    private function varyTemplateSectionValues(array $sectionValues, array $blueprint, Store $store, ?BusinessCategory $businessCategory, ?array $aiPreferences, ?Template $template = null): array
+    {
+        if (!Schema::hasTable('designlists') || $this->templateRequestIsLocked($aiPreferences)) {
+            return $sectionValues;
+        }
+
+        $varied = 0;
+        foreach ($this->designSectionTypeMap() as $section => $type) {
+            if (!$this->sectionCanAutoVary($section) || !$this->sectionValueIsUsable($sectionValues[$section] ?? '')) {
+                continue;
+            }
+
+            $shouldVary = $this->spreadPick([['use' => false], ['use' => true], ['use' => true]], 'vary:' . $section, $store, $businessCategory);
+            if (!($shouldVary['use'] ?? false) && $varied > 0) {
+                continue;
+            }
+
+            $row = $this->chooseDesignlistForType($section, $type, $blueprint, $store, $businessCategory, $aiPreferences, $template);
+            $value = trim((string) ($row->value ?? ''));
+            if ($value !== '' && $value !== trim((string) ($sectionValues[$section] ?? ''))) {
+                $sectionValues[$section] = $value;
+                $varied++;
+            }
+        }
+
+        return $sectionValues;
+    }
+
+    private function sectionCanAutoVary(string $section): bool
+    {
+        return in_array($section, [
+            'header',
+            'hero_slider',
+            'banner',
+            'banner_bottom',
+            'feature_category',
+            'product',
+            'feature_product',
+            'best_sell_product',
+            'new_arrival',
+            'testimonial',
+            'footer',
+            'product_card',
+            'mobile_bottom_menu',
+        ], true);
+    }
+
+    private function fillMissingSectionValuesFromDesignlists(array $sectionValues, array $blueprint, Store $store, ?BusinessCategory $businessCategory, ?array $aiPreferences, ?Template $template = null): array
     {
         if (!Schema::hasTable('designlists')) {
             return $sectionValues;
@@ -733,7 +1582,7 @@ class AiStoreSeedService
             if ($this->sectionValueIsUsable($sectionValues[$section] ?? '')) {
                 continue;
             }
-            $row = $this->chooseDesignlistForType($type, $blueprint, $businessCategory, $aiPreferences, $template);
+            $row = $this->chooseDesignlistForType($section, $type, $blueprint, $store, $businessCategory, $aiPreferences, $template);
             if ($row && trim((string) ($row->value ?? '')) !== '') {
                 $sectionValues[$section] = (string) $row->value;
             }
@@ -742,7 +1591,7 @@ class AiStoreSeedService
         return $sectionValues;
     }
 
-    private function chooseDesignlistForType(string $type, array $blueprint, ?BusinessCategory $businessCategory, ?array $aiPreferences, ?Template $template = null): ?Designlist
+    private function chooseDesignlistForType(string $section, string $type, array $blueprint, Store $store, ?BusinessCategory $businessCategory, ?array $aiPreferences, ?Template $template = null): ?Designlist
     {
         $rows = Designlist::query()
             ->where('type', $type)
@@ -762,7 +1611,19 @@ class AiStoreSeedService
             ->sortByDesc('score')
             ->values();
 
-        return $ranked->first()['row'] ?? $rows->first();
+        $maxScore = (int) ($ranked->max('score') ?? 0);
+        $pool = $ranked
+            ->filter(fn ($item) => (int) $item['score'] >= $maxScore - 24)
+            ->values();
+        $recentValues = $this->recentDesignValuesForCategory($section, $store, $businessCategory);
+        $freshPool = $pool
+            ->reject(fn ($item) => in_array(trim((string) ($item['row']->value ?? '')), $recentValues, true))
+            ->values();
+
+        $selectedPool = $freshPool->isNotEmpty() ? $freshPool : $pool;
+        $selected = $this->spreadPick($selectedPool->all(), $section . ':' . $type, $store, $businessCategory);
+
+        return $selected['row'] ?? $ranked->first()['row'] ?? $rows->first();
     }
 
     private function designlistMatchScore(Designlist $row, array $blueprint, ?BusinessCategory $businessCategory, ?array $aiPreferences, ?Template $template = null): int
@@ -1066,8 +1927,9 @@ class AiStoreSeedService
                 continue;
             }
 
-            $sourceImage = $this->seedImageById($item['image_seed_id'] ?? null)
+            $sourceImage = $this->seedImageByIdForUse($item['image_seed_id'] ?? null, 'product')
                 ?: $this->pickImage('product', $businessCategory, (array) ($item['image_tags'] ?? []), $categorySlug, $subcategorySlug);
+            $this->rememberSeedImage($sourceImage, 'product');
             $generatedImage = $sourceImage
                 ? $this->copySeedImage($sourceImage, $store, 'products', (int) ($profile['width'] ?? 900), (int) ($profile['height'] ?? 900), 'product_' . ($index + 1))
                 : null;
@@ -1124,8 +1986,9 @@ class AiStoreSeedService
 
         foreach ($sliderBanners as $index => $item) {
             $usageType = (string) ($item['usage_type'] ?? 'banner');
-            $sourceImage = $this->seedImageById($item['image_seed_id'] ?? null)
+            $sourceImage = $this->seedImageByIdForUse($item['image_seed_id'] ?? null, $usageType)
                 ?: $this->pickImage($usageType, $businessCategory, (array) ($item['image_tags'] ?? []), '', '');
+            $this->rememberSeedImage($sourceImage, $usageType);
             $generatedImage = $sourceImage
                 ? $this->copySeedImage($sourceImage, $store, $usageType === 'slider' ? 'sliders' : 'banners', $usageType === 'slider' ? 1600 : 1200, $usageType === 'slider' ? 600 : 500, $usageType . '_' . ($index + 1))
                 : null;
@@ -1176,23 +2039,35 @@ class AiStoreSeedService
                         }
                     });
 
-                if ($image = $this->firstSeedImageCandidate($query, $tags, $categorySlug, $subcategorySlug)) {
+                if ($image = $this->firstSeedImageCandidate($query, $tags, $categorySlug, $subcategorySlug, $usageType)) {
                     return $image;
                 }
             }
 
             $globalQuery = $this->baseSeedImageQuery($candidateUsageType)
                 ->whereNull('business_category_id');
-            if ($image = $this->firstSeedImageCandidate($globalQuery, $tags, $categorySlug, $subcategorySlug)) {
+            if ($image = $this->firstSeedImageCandidate($globalQuery, $tags, $categorySlug, $subcategorySlug, $usageType)) {
                 return $image;
             }
 
-            if ($image = $this->firstSeedImageCandidate($this->baseSeedImageQuery($candidateUsageType), $tags, $categorySlug, $subcategorySlug)) {
+            if ($image = $this->firstSeedImageCandidate($this->baseSeedImageQuery($candidateUsageType), $tags, $categorySlug, $subcategorySlug, $usageType)) {
                 return $image;
             }
         }
 
-        return null;
+        return $this->firstActiveSeedImage();
+    }
+
+    private function firstActiveSeedImage(): ?AiSeedImageLibrary
+    {
+        if (!Schema::hasTable('ai_seed_image_libraries')) {
+            return null;
+        }
+
+        return AiSeedImageLibrary::query()
+            ->where('status', true)
+            ->latest('id')
+            ->first();
     }
 
     private function seedImageById($id): ?AiSeedImageLibrary
@@ -1205,6 +2080,16 @@ class AiStoreSeedService
             ->where('id', (int) $id)
             ->where('status', true)
             ->first();
+    }
+
+    private function seedImageByIdForUse($id, string $bucket): ?AiSeedImageLibrary
+    {
+        $image = $this->seedImageById($id);
+        if (!$image || $this->seedImageAlreadyUsed($image, $bucket)) {
+            return null;
+        }
+
+        return $image;
     }
 
     private function seedImageCandidatesForBot(?BusinessCategory $businessCategory): array
@@ -1261,7 +2146,21 @@ class AiStoreSeedService
             ->where('status', true);
     }
 
-    private function firstSeedImageCandidate($query, array $tags, string $categorySlug, string $subcategorySlug): ?AiSeedImageLibrary
+    private function firstSeedImageCandidate($query, array $tags, string $categorySlug, string $subcategorySlug, ?string $bucket = null): ?AiSeedImageLibrary
+    {
+        $usedIds = $this->usedSeedImageIdsFor($bucket);
+        if (!empty($usedIds)) {
+            $unusedQuery = clone $query;
+            $unusedQuery->whereNotIn('id', $usedIds);
+            if ($image = $this->orderedSeedImageCandidate($unusedQuery, $tags, $categorySlug, $subcategorySlug)) {
+                return $image;
+            }
+        }
+
+        return $this->orderedSeedImageCandidate($query, $tags, $categorySlug, $subcategorySlug);
+    }
+
+    private function orderedSeedImageCandidate($query, array $tags, string $categorySlug, string $subcategorySlug): ?AiSeedImageLibrary
     {
         if ($categorySlug !== '') {
             $query->orderByRaw('CASE WHEN category_slug = ? THEN 0 ELSE 1 END', [$categorySlug]);
@@ -1274,6 +2173,37 @@ class AiStoreSeedService
         }
 
         return $query->orderByDesc('id')->first();
+    }
+
+    private function usedSeedImageIdsFor(?string $bucket): array
+    {
+        $bucket = trim((string) $bucket);
+        if ($bucket === '') {
+            return [];
+        }
+
+        return array_values(array_unique(array_map('intval', $this->usedSeedImageIds[$bucket] ?? [])));
+    }
+
+    private function seedImageAlreadyUsed(AiSeedImageLibrary $image, string $bucket): bool
+    {
+        $id = (int) $image->id;
+        if ($id <= 0) {
+            return false;
+        }
+
+        return in_array($id, $this->usedSeedImageIdsFor($bucket), true);
+    }
+
+    private function rememberSeedImage(?AiSeedImageLibrary $image, string $bucket): void
+    {
+        if (!$image || (int) $image->id <= 0) {
+            return;
+        }
+
+        $bucket = trim($bucket) ?: 'product';
+        $this->usedSeedImageIds[$bucket] ??= [];
+        $this->usedSeedImageIds[$bucket][] = (int) $image->id;
     }
 
     private function copySeedImage(AiSeedImageLibrary $image, Store $store, string $folder, int $width, int $height, string $name): ?string
@@ -1293,7 +2223,7 @@ class AiStoreSeedService
         $target = $disk->path($targetPath);
 
         if ($this->resizeCover($source, $target, $width, $height)) {
-            return $legacy ?: 'storage/' . $targetPath;
+            return 'storage/' . $targetPath;
         }
 
         $fallbackExtension = strtolower((string) pathinfo($sourcePath ?: (string) $image->path, PATHINFO_EXTENSION));
@@ -1304,7 +2234,7 @@ class AiStoreSeedService
         } else {
             $disk->put($fallbackPath, (string) @file_get_contents($source));
         }
-        return $legacy ?: 'storage/' . $fallbackPath;
+        return 'storage/' . $fallbackPath;
     }
 
     private function copySeedImageToLegacyAssetDirectory(string $source, string $sourcePath, string $folder, int $width, int $height, string $name): ?string
@@ -1348,11 +2278,13 @@ class AiStoreSeedService
 
     private function assignCategorySeedImages(Category $row, Store $store, ?BusinessCategory $businessCategory, string $categorySlug, string $subcategorySlug, int $index, $seedImageId = null): void
     {
-        $sourceImage = $this->seedImageById($seedImageId)
-            ?: $this->pickImage('category', $businessCategory, [], $categorySlug, $subcategorySlug);
+        $sourceImage = $this->seedImageByIdForUse($seedImageId, 'category')
+            ?: $this->pickImage('category', $businessCategory, [], $categorySlug, $subcategorySlug)
+            ?: $this->firstActiveSeedImage();
         if (!$sourceImage) {
             return;
         }
+        $this->rememberSeedImage($sourceImage, 'category');
 
         if (Schema::hasColumn($row->getTable(), 'banner') && empty((string) ($row->banner ?? ''))) {
             $bannerImage = $this->copySeedImage($sourceImage, $store, 'categories', 1200, 500, 'category_banner_' . $index);
@@ -1379,11 +2311,7 @@ class AiStoreSeedService
 
     private function repairMissingStoreSeedImages(AiSeedBatch $batch, Store $store, ?BusinessCategory $businessCategory): void
     {
-        $productImage = $this->pickImage('product', $businessCategory, [], '', '');
-        $sliderImage = $this->pickImage('slider', $businessCategory, [], '', '') ?: $productImage;
-        $bannerImage = $this->pickImage('banner', $businessCategory, [], '', '') ?: $productImage;
-
-        if ($productImage && Schema::hasTable('products')) {
+        if (Schema::hasTable('products')) {
             Product::query()
                 ->where('store_id', (string) $store->id)
                 ->where(function ($query) {
@@ -1391,7 +2319,12 @@ class AiStoreSeedService
                 })
                 ->orderBy('id')
                 ->get()
-                ->each(function (Product $product, int $index) use ($batch, $store, $productImage) {
+                ->each(function (Product $product, int $index) use ($batch, $store, $businessCategory) {
+                    $productImage = $this->pickImage('product', $businessCategory, [], '', '');
+                    if (!$productImage) {
+                        return;
+                    }
+                    $this->rememberSeedImage($productImage, 'product');
                     $generatedImage = $this->copySeedImage($productImage, $store, 'products', 900, 900, 'product_repair_' . ($index + 1));
                     if (!$generatedImage) {
                         return;
@@ -1414,7 +2347,7 @@ class AiStoreSeedService
                 });
         }
 
-        if ($sliderImage && Schema::hasTable('sliders')) {
+        if (Schema::hasTable('sliders')) {
             Slider::query()
                 ->where('store_id', (string) $store->id)
                 ->where(function ($query) {
@@ -1422,7 +2355,12 @@ class AiStoreSeedService
                 })
                 ->orderBy('id')
                 ->get()
-                ->each(function (Slider $slider, int $index) use ($store, $sliderImage) {
+                ->each(function (Slider $slider, int $index) use ($store, $businessCategory) {
+                    $sliderImage = $this->pickImage('slider', $businessCategory, [], '', '');
+                    if (!$sliderImage) {
+                        return;
+                    }
+                    $this->rememberSeedImage($sliderImage, 'slider');
                     $generatedImage = $this->copySeedImage($sliderImage, $store, 'sliders', 1600, 600, 'slider_repair_' . ($index + 1));
                     if ($generatedImage) {
                         $this->setIfColumn($slider, 'image', $generatedImage);
@@ -1431,7 +2369,7 @@ class AiStoreSeedService
                 });
         }
 
-        if ($bannerImage && Schema::hasTable('banners')) {
+        if (Schema::hasTable('banners')) {
             Banner::query()
                 ->where('store_id', (string) $store->id)
                 ->where(function ($query) {
@@ -1439,7 +2377,12 @@ class AiStoreSeedService
                 })
                 ->orderBy('id')
                 ->get()
-                ->each(function (Banner $banner, int $index) use ($store, $bannerImage) {
+                ->each(function (Banner $banner, int $index) use ($store, $businessCategory) {
+                    $bannerImage = $this->pickImage('banner', $businessCategory, [], '', '');
+                    if (!$bannerImage) {
+                        return;
+                    }
+                    $this->rememberSeedImage($bannerImage, 'banner');
                     $generatedImage = $this->copySeedImage($bannerImage, $store, 'banners', 1200, 500, 'banner_repair_' . ($index + 1));
                     if ($generatedImage) {
                         $this->setIfColumn($banner, 'image', $generatedImage);
@@ -1468,12 +2411,20 @@ class AiStoreSeedService
             return '';
         }
 
+        if (str_contains($path, 'media-library/file?')) {
+            $query = parse_url($path, PHP_URL_QUERY);
+            if (is_string($query) && $query !== '') {
+                parse_str($query, $params);
+                $path = (string) ($params['path'] ?? $path);
+            }
+        }
+
         if (preg_match('#^https?://[^/]+/(.+)$#i', $path, $matches)) {
             $path = (string) ($matches[1] ?? $path);
         }
 
         $path = ltrim($path, '/');
-        foreach (['storage/', 'public/storage/', 'app/public/'] as $prefix) {
+        foreach (['react-admin-api/public/media-library/file?path=', 'storage/', 'public/storage/', 'storage/app/public/', 'app/public/'] as $prefix) {
             if (str_starts_with($path, $prefix)) {
                 $path = substr($path, strlen($prefix));
             }
