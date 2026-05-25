@@ -8,6 +8,7 @@ use App\Models\Banner;
 use App\Models\Brand;
 use App\Models\BusinessCategory;
 use App\Models\Category;
+use App\Models\CheckoutForm;
 use App\Models\Customer;
 use App\Models\Design;
 use App\Models\Designlist;
@@ -21,6 +22,7 @@ use App\Models\Store;
 use App\Models\StoreDesign;
 use App\Models\Template;
 use App\Models\Testimonial;
+use App\Services\StorefrontBootstrapCache;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
@@ -248,6 +250,10 @@ class AdminReactDesignController extends Controller
         }
 
         $sectionSettings = $this->decodeSectionSettings($design);
+        $sectionSettings['checkout-page'] = array_merge(
+            is_array($sectionSettings['checkout-page'] ?? null) ? $sectionSettings['checkout-page'] : [],
+            $this->checkoutFieldSettingsForStore($storeId)
+        );
         $templateValues = $this->sectionTemplateValues($design, $sectionSettings);
         $templateOptions = $this->sectionTemplateOptions();
 
@@ -296,6 +302,89 @@ class AdminReactDesignController extends Controller
         });
 
         return $items;
+    }
+
+    private function defaultCheckoutFieldStatuses(): array
+    {
+        return [
+            'name' => 1,
+            'phone' => 1,
+            'email' => 0,
+            'address' => 1,
+            'note' => 0,
+            'district' => 0,
+            'language' => 0,
+        ];
+    }
+
+    private function checkoutFieldSettingsForStore(int $storeId): array
+    {
+        if ($storeId <= 0 || !Schema::hasTable('checkout_forms')) {
+            return [
+                'show_checkout_name' => true,
+                'show_checkout_phone' => true,
+                'show_checkout_email' => false,
+                'show_checkout_address' => true,
+                'show_checkout_note' => false,
+                'show_checkout_district' => false,
+                'show_checkout_language' => false,
+            ];
+        }
+
+        $statuses = $this->defaultCheckoutFieldStatuses();
+        $rows = CheckoutForm::query()
+            ->where('store_id', (string) $storeId)
+            ->get(['name', 'status']);
+
+        if ($rows->isEmpty()) {
+            foreach ($statuses as $name => $status) {
+                CheckoutForm::query()->updateOrCreate(
+                    ['name' => $name, 'store_id' => (string) $storeId],
+                    ['status' => $status]
+                );
+            }
+        } else {
+            foreach ($rows as $row) {
+                $name = (string) ($row->name ?? '');
+                if (array_key_exists($name, $statuses)) {
+                    $statuses[$name] = (int) ($row->status ?? 0);
+                }
+            }
+        }
+
+        return [
+            'show_checkout_name' => (bool) ($statuses['name'] ?? 0),
+            'show_checkout_phone' => (bool) ($statuses['phone'] ?? 0),
+            'show_checkout_email' => (bool) ($statuses['email'] ?? 0),
+            'show_checkout_address' => (bool) ($statuses['address'] ?? 0),
+            'show_checkout_note' => (bool) ($statuses['note'] ?? 0),
+            'show_checkout_district' => (bool) ($statuses['district'] ?? 0),
+            'show_checkout_language' => (bool) ($statuses['language'] ?? 0),
+        ];
+    }
+
+    private function saveCheckoutFieldSettings(int $storeId, array $settings): void
+    {
+        if ($storeId <= 0 || !Schema::hasTable('checkout_forms')) {
+            return;
+        }
+
+        $map = [
+            'name' => 'show_checkout_name',
+            'phone' => 'show_checkout_phone',
+            'email' => 'show_checkout_email',
+            'address' => 'show_checkout_address',
+            'note' => 'show_checkout_note',
+            'district' => 'show_checkout_district',
+            'language' => 'show_checkout_language',
+        ];
+
+        foreach ($map as $name => $settingKey) {
+            CheckoutForm::query()->updateOrCreate(
+                ['name' => $name, 'store_id' => (string) $storeId],
+                ['status' => !empty($settings[$settingKey]) ? 1 : 0]
+            );
+        }
     }
 
     private function previewAssetUrl(?string $value, string $directory = ''): ?string
@@ -979,6 +1068,27 @@ class AdminReactDesignController extends Controller
         ]);
     }
 
+    public function resetStorefrontBootstrapCache(): JsonResponse
+    {
+        $ctx = $this->resolveContext();
+        $store = Store::query()->find((int) $ctx['store_id']);
+
+        if (!$store) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Store not found.',
+            ], 404);
+        }
+
+        $cleared = StorefrontBootstrapCache::forget($store);
+
+        return response()->json([
+            'success' => true,
+            'cleared' => $cleared,
+            'message' => $cleared ? 'Storefront cache reset.' : 'No matching cache entry was found.',
+        ]);
+    }
+
     public function saveHeaderSettings(Request $request): JsonResponse
     {
         $payload = $request->validate([
@@ -1023,6 +1133,10 @@ class AdminReactDesignController extends Controller
             $mappedColumn = self::SECTION_COLUMN_MAP[$sectionKey] ?? null;
             if ($mappedColumn && $sectionTemplate !== '' && Schema::hasColumn('designs', $mappedColumn)) {
                 $design->{$mappedColumn} = $sectionTemplate;
+            }
+
+            if ($sectionKey === 'checkout-page') {
+                $this->saveCheckoutFieldSettings((int) $ctx['store_id'], $entry);
             }
         }
 

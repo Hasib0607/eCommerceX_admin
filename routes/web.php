@@ -30,7 +30,13 @@ Route::prefix('react-admin-api')->group(function () {
     Route::post('/password/resend-otp', [AdminReactController::class, 'passwordResendOtp'])->middleware('guest');
     Route::post('/password/reset', [AdminReactController::class, 'passwordReset'])->middleware('guest');
     Route::get('/public/branding', [AdminReactController::class, 'publicBranding']);
-    Route::get('/public/media-library/file', [AdminReactController::class, 'publicMediaLibraryFile']);
+    Route::get('/public/media-library/file', [AdminReactController::class, 'publicMediaLibraryFile'])
+        ->withoutMiddleware([
+            \Illuminate\Cookie\Middleware\AddQueuedCookiesToResponse::class,
+            \App\Http\Middleware\VerifyCsrfToken::class,
+            \Illuminate\Session\Middleware\StartSession::class,
+            \Illuminate\View\Middleware\ShareErrorsFromSession::class,
+        ]);
 
     Route::prefix('public/landing')->group(function () {
         Route::post('/register', [LandingPublicApiController::class, 'register'])->middleware('guest');
@@ -43,6 +49,7 @@ Route::prefix('react-admin-api')->group(function () {
     Route::middleware(['auth', 'react.entitlement'])->group(function () {
         Route::get('/me', [AdminReactController::class, 'me']);
         Route::get('/dashboard', [AdminReactController::class, 'dashboardOverview']);
+        Route::post('/ai-fill', [AdminReactController::class, 'superadminAiFill']);
         Route::post('/whatsapp/gateway/sessions/create', [GatewaySessionController::class, 'create']);
         Route::get('/whatsapp/gateway/sessions/{tenantId}/status', [GatewaySessionController::class, 'status']);
         Route::get('/whatsapp/gateway/sessions/{tenantId}/qr', [GatewaySessionController::class, 'qr']);
@@ -338,6 +345,7 @@ Route::prefix('react-admin-api')->group(function () {
         Route::get('/design/layout-sections', [AdminReactDesignController::class, 'layoutSections']);
         Route::get('/design/homepage-preview', [AdminReactDesignController::class, 'homepagePreview']);
         Route::post('/design/layout-sections/reorder', [AdminReactDesignController::class, 'reorderLayoutSections']);
+        Route::post('/design/storefront-bootstrap-cache/reset', [AdminReactDesignController::class, 'resetStorefrontBootstrapCache']);
         Route::get('/design/testimonials', [AdminReactDesignController::class, 'testimonials']);
         Route::post('/design/testimonials', [AdminReactDesignController::class, 'testimonialStore']);
         Route::post('/design/testimonials/{id}', [AdminReactDesignController::class, 'testimonialUpdate'])->whereNumber('id');

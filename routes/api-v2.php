@@ -162,6 +162,7 @@ Route::prefix('whatsapp')->group(function () {
 //facebook pixel and google analytics status
 Route::prefix('v2')->group(function () {
     Route::get('/marketing-modules-status/{store}', [MarketingController::class, 'index']);
+    Route::post('/meta-conversions/{store}', [MarketingController::class, 'trackMetaConversion']);
 });
 
 Route::post('/v2/address/easy-order/save', [UserController::class, 'saveaddress']);

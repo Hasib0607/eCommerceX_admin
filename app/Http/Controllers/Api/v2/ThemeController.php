@@ -49,8 +49,6 @@ class ThemeController extends Controller
             $header_setting->google_analytics = $quickLogin[10]->google_analytics ?? null;
             $header_setting->google_search_console = $quickLogin[10]->google_search_console ?? null;
             $header_setting->facebook_pixel = $quickLogin[11]->facebook_pixel ?? null;
-            $header_setting->facebook_access_token = $quickLogin[11]->general_access_token ?? null;
-            $header_setting->facebook_test_event_code = $quickLogin[11]->test_event_code ?? null;
             $header_setting->domain_verification_code = $quickLogin[11]->domain_verification_code ?? null;
 
             $header_setting->currency = $store->current_currency;

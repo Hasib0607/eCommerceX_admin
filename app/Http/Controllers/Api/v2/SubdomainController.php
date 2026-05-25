@@ -46,6 +46,7 @@ use App\Models\Testimonial;
 use App\Models\Unit;
 use App\Models\User;
 use App\Models\Veriant;
+use App\Services\StorefrontBootstrapCache;
 use Auth;
 use Carbon\Carbon;
 use Exception;
@@ -53,11 +54,19 @@ use Illuminate\Http\Request;
 use Illuminate\Http\Response;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Schema;
 use Illuminate\Support\Str;
 use App\Http\Resources\ProductLayoutResource;
 
 class SubdomainController extends Controller
 {
+    private const PRODUCT_TEMPLATE_DEPENDENCY_MAP = [
+        'one' => ['feature_product', 'best_sell_product'],
+        'eleven' => ['feature_product', 'best_sell_product'],
+        'thirtythree' => ['feature_product', 'best_sell_product'],
+        'fortyone' => ['feature_product', 'best_sell_product'],
+    ];
+
     /**
      * Display a listing of the resource.
      *
@@ -203,14 +212,7 @@ class SubdomainController extends Controller
                 'customize_rate_status' => $store->current_currency_customize_rate_status,
             ] : null);
 
-            if (config('cache.default') === 'file') {
-                $payload = $this->buildStorefrontBootstrapPayload($store);
-            } else {
-                $cacheKey = "storefront_bootstrap:{$store->id}:{$store->template_id}:v2";
-                $payload = Cache::remember($cacheKey, now()->addSeconds(60), function () use ($store) {
-                    return $this->buildStorefrontBootstrapPayload($store);
-                });
-            }
+            $payload = $this->rememberStorefrontBootstrapPayload($store);
 
             return response()->json([
                 'status' => true,
@@ -231,12 +233,25 @@ class SubdomainController extends Controller
         $menu = $this->storefrontMenu($store);
         $page = $this->storefrontPages($store);
         $category = $this->storefrontCategories($store);
-        $slider = $this->storefrontSliders($store);
-        $banner = $this->storefrontBanners($store);
-        $products = $this->storefrontProducts($store, 'product');
-        $featureProducts = $this->storefrontProducts($store, 'feature');
-        $bestSellProducts = $this->storefrontProducts($store, 'best_sell');
-        $newArrivalProducts = $this->storefrontProducts($store, 'new_arrival');
+        $slider = $this->storefrontSliders($store, $this->storefrontSliderLimit());
+        $banner = $this->storefrontBanners($store, $this->storefrontBannerLimit());
+        $productSectionEnabled = $this->isStorefrontSectionEnabled($layout, $design, 'product');
+        $productTemplateDependencies = $productSectionEnabled
+            ? $this->storefrontProductTemplateDependencies($design['product'] ?? null)
+            : [];
+        $featureProductRequired = $this->storefrontProductTemplateRequires($productTemplateDependencies, 'feature_product');
+        $bestSellProductRequired = $this->storefrontProductTemplateRequires($productTemplateDependencies, 'best_sell_product');
+
+        $products = $productSectionEnabled
+            ? $this->storefrontProducts($store, 'product', $this->storefrontProductLimit($design, 'product'))
+            : [];
+        $featureProducts = $featureProductRequired
+            ? $this->storefrontProducts($store, 'feature', $this->storefrontProductLimit($design, 'feature-product'))
+            : [];
+        $bestSellProducts = $bestSellProductRequired
+            ? $this->storefrontProducts($store, 'best_sell', $this->storefrontProductLimit($design, 'best-sell-product'))
+            : [];
+        $newArrivalProducts = [];
         $boughtModuleStatus = BuyModulus::query()
             ->where('store_id', $store->id)
             ->pluck('status', 'modulus_id')
@@ -279,16 +294,46 @@ class SubdomainController extends Controller
                 'feature_category' => ['design' => $design['feature_category'] ?? null, 'items' => $category],
                 'banner' => ['design' => $design['banner'] ?? null, 'items' => array_values(array_filter($banner, fn ($item) => (int) ($item['type'] ?? 0) === 0))],
                 'banner_bottom' => ['design' => $design['banner_bottom'] ?? null, 'items' => array_values(array_filter($banner, fn ($item) => (int) ($item['type'] ?? 0) === 1))],
-                'product' => ['design' => $design['product'] ?? null, 'items' => $products],
-                'feature_product' => ['design' => $design['feature_product'] ?? null, 'items' => $featureProducts],
-                'best_sell_product' => ['design' => $design['best_sell_product'] ?? null, 'items' => $bestSellProducts],
-                'new_arrival' => ['design' => $design['new_arrival'] ?? null, 'items' => $newArrivalProducts],
+                'product' => ['design' => $design['product'] ?? null],
+                'feature_product' => ['design' => $design['feature_product'] ?? null],
+                'best_sell_product' => ['design' => $design['best_sell_product'] ?? null],
+                'new_arrival' => ['design' => $design['new_arrival'] ?? null],
                 'menu' => ['items' => $menu],
                 'page' => ['items' => $page],
             ],
         ];
 
         return $payload;
+    }
+
+    private function rememberStorefrontBootstrapPayload(Store $store): array
+    {
+        return StorefrontBootstrapCache::remember($store, function () use ($store) {
+            return $this->buildStorefrontBootstrapPayload($store);
+        });
+    }
+
+    private function isStorefrontSectionEnabled(array $layout, array $design, string $section): bool
+    {
+        if (!in_array($section, $layout, true)) {
+            return false;
+        }
+
+        $value = $design[$section] ?? null;
+
+        return $value !== null && $value !== '' && $value !== 'null' && $value !== 'none';
+    }
+
+    private function storefrontProductTemplateDependencies($template): array
+    {
+        $key = strtolower(trim((string) $template));
+
+        return self::PRODUCT_TEMPLATE_DEPENDENCY_MAP[$key] ?? [];
+    }
+
+    private function storefrontProductTemplateRequires(array $dependencies, string $section): bool
+    {
+        return in_array($section, $dependencies, true);
     }
 
     private function storefrontStore(Store $store): array
@@ -342,6 +387,9 @@ class SubdomainController extends Controller
             'product_card', 'product_modal', 'preloader', 'mobile_bottom_menu', 'offer',
             'blog', 'contact',
         ];
+        if (Schema::hasColumn('designs', 'section_settings')) {
+            $columns[] = 'section_settings';
+        }
 
         $design = DB::table('designs')->where('store_id', $store->id)->first($columns);
         if (!$design) {
@@ -384,8 +432,6 @@ class SubdomainController extends Controller
                 'google_login.google_analytics',
                 'google_login.google_search_console',
                 'facebook_login.facebook_pixel',
-                'facebook_login.general_access_token as facebook_access_token',
-                'facebook_login.test_event_code as facebook_test_event_code',
                 'facebook_login.domain_verification_code',
             ]);
         if (!$header) {
@@ -409,8 +455,6 @@ class SubdomainController extends Controller
             'google_analytics' => $header->google_analytics ?? null,
             'google_search_console' => $header->google_search_console ?? null,
             'facebook_pixel' => $header->facebook_pixel ?? null,
-            'facebook_access_token' => $header->facebook_access_token ?? null,
-            'facebook_test_event_code' => $header->facebook_test_event_code ?? null,
             'domain_verification_code' => $header->domain_verification_code ?? null,
         ];
     }
@@ -472,13 +516,13 @@ class SubdomainController extends Controller
             ->all();
     }
 
-    private function storefrontSliders(Store $store): array
+    private function storefrontSliders(Store $store, int $limit): array
     {
         return DB::table('sliders')
             ->where('store_id', $store->id)
             ->where('status', 'active')
             ->orderBy('position', 'ASC')
-            ->limit(8)
+            ->limit($limit)
             ->get(['id', 'image', 'subimage', 'title', 'subtitle', 'button', 'link', 'color', 'subtitle_color', 'button_color', 'position'])
             ->map(fn ($item) => [
                 'id' => (int) $item->id,
@@ -497,13 +541,13 @@ class SubdomainController extends Controller
             ->all();
     }
 
-    private function storefrontBanners(Store $store): array
+    private function storefrontBanners(Store $store, int $limit): array
     {
         return DB::table('banners')
             ->where('store_id', $store->id)
             ->where('status', 'active')
             ->orderBy('id', 'ASC')
-            ->limit(12)
+            ->limit($limit)
             ->get(['id', 'image', 'link', 'type'])
             ->map(fn ($item) => [
                 'id' => (int) $item->id,
@@ -515,7 +559,17 @@ class SubdomainController extends Controller
             ->all();
     }
 
-    private function storefrontProducts(Store $store, string $mode): array
+    private function storefrontSliderLimit(): int
+    {
+        return max(1, min((int) config('storefront.bootstrap_slider_limit', 3), 8));
+    }
+
+    private function storefrontBannerLimit(): int
+    {
+        return max(1, min((int) config('storefront.bootstrap_banner_limit', 6), 12));
+    }
+
+    private function storefrontProducts(Store $store, string $mode, int $limit): array
     {
         $query = Product::query()
             ->leftJoin('currencies', 'products.currency_id', '=', 'currencies.id')
@@ -552,11 +606,52 @@ class SubdomainController extends Controller
             ? $query->orderByDesc('products.created_at')
             : $query->orderBy('products.position', 'ASC');
 
-        return $query->with(['variant:id,pid,image,color_image'])->limit(12)
+        return $query->with(['variant:id,pid,image,color_image'])->limit($limit)
             ->get()
             ->map(fn ($product) => $this->storefrontProductCard($product, $store))
             ->values()
             ->all();
+    }
+
+    private function storefrontProductLimit(array $design, string $sectionKey): int
+    {
+        $limit = (int) config('storefront.bootstrap_product_limit', 8);
+        $settings = $this->storefrontSectionSettings($design);
+        $sectionLimit = $settings[$sectionKey]['product_limit'] ?? null;
+
+        if (is_numeric($sectionLimit)) {
+            $limit = (int) $sectionLimit;
+        }
+
+        return max(1, min($limit, 48));
+    }
+
+    private function storefrontEndpointProductLimit(Request $request): int
+    {
+        $limit = (int) config('storefront.bootstrap_product_limit', 8);
+        $requestedLimit = $request->query('limit');
+
+        if (is_numeric($requestedLimit)) {
+            $limit = (int) $requestedLimit;
+        }
+
+        return max(1, min($limit, 48));
+    }
+
+    private function storefrontSectionSettings(array $design): array
+    {
+        $raw = $design['section_settings'] ?? null;
+        if (is_array($raw)) {
+            return $raw;
+        }
+
+        if (!is_string($raw) || trim($raw) === '') {
+            return [];
+        }
+
+        $decoded = json_decode($raw, true);
+
+        return is_array($decoded) ? $decoded : [];
     }
 
     private function storefrontProductCard($product, Store $store): array
@@ -734,7 +829,7 @@ class SubdomainController extends Controller
     }
 
 
-    public function getDomainSection($name, $section)
+    public function getDomainSection(Request $request, $name, $section)
     {
         try {
             if (empty($name) || is_null($name)) {
@@ -849,9 +944,10 @@ class SubdomainController extends Controller
                         return response()->json(['status' => true, 'message' => 'Success', 'data' => $page]);
 
                     case 'best_sell_product':
-                        $cacheKey = "store_{$store->id}_best_sell_product";
+                        $limit = $this->storefrontEndpointProductLimit($request);
+                        $cacheKey = "store_{$store->id}_best_sell_product_{$limit}";
 
-                        $data = Cache::remember($cacheKey, now()->addMinutes(5), function () use ($store) {
+                        $data = Cache::remember($cacheKey, now()->addMinutes(5), function () use ($store, $limit) {
                             return Product::convertCurrency($store->id)
                                 ->where('products.status', 'active')
                                 ->where('products.best_sell', 1)
@@ -864,7 +960,7 @@ class SubdomainController extends Controller
                                 ->withCount('reviews')
                                 ->orderBy('products.position', 'ASC')
                                 ->inRandomOrder()
-                                ->limit(10)
+                                ->limit($limit)
                                 ->get();
                         });
 
@@ -873,9 +969,10 @@ class SubdomainController extends Controller
                         return response()->json(['status' => true, 'message' => 'Success', 'data' => $best_sell_product]);
 
                     case 'feature_product':
-                        $cacheKey = "store_{$store->id}_feature_product";
+                        $limit = $this->storefrontEndpointProductLimit($request);
+                        $cacheKey = "store_{$store->id}_feature_product_{$limit}";
 
-                        $data = Cache::remember($cacheKey, now()->addMinutes(5), function () use ($store) {
+                        $data = Cache::remember($cacheKey, now()->addMinutes(5), function () use ($store, $limit) {
                             return Product::convertCurrency($store->id)
                                 ->where('products.status', 'active')
                                 ->where('products.feature', 1)
@@ -888,13 +985,37 @@ class SubdomainController extends Controller
                                 ->withCount('reviews')
                                 ->orderBy('products.position', 'ASC')
                                 ->inRandomOrder()
-                                ->limit(10)
+                                ->limit($limit)
                                 ->get();
                         });
 
                         $feature_products = $this->getProductResponse($data, $store->id);
 
                         return response()->json(['status' => true, 'message' => 'Success', 'data' => $feature_products]);
+
+                    case 'new_arrival':
+                    case 'new_arrival_product':
+                        $limit = $this->storefrontEndpointProductLimit($request);
+                        $cacheKey = "store_{$store->id}_new_arrival_product_{$limit}";
+
+                        $data = Cache::remember($cacheKey, now()->addMinutes(5), function () use ($store, $limit) {
+                            return Product::convertCurrency($store->id)
+                                ->where('products.status', 'active')
+                                ->with([
+                                    'getBrand' => function ($query) {
+                                        $query->select('id', 'name');
+                                    }
+                                ])
+                                ->withSum('reviews', 'rating')
+                                ->withCount('reviews')
+                                ->orderByDesc('products.created_at')
+                                ->limit($limit)
+                                ->get();
+                        });
+
+                        $new_arrival_product = $this->getProductResponse($data, $store->id);
+
+                        return response()->json(['status' => true, 'message' => 'Success', 'data' => $new_arrival_product]);
 
                     case 'testimonial':
                         $testimonials = Testimonial::where('store_id', $store->id)->where('status', 'active')->get();
